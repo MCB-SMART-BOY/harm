@@ -1,7 +1,7 @@
 use super::{next_u64, splitmix64};
 use crate::bench::PhaseConfig;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, time::Duration};
+use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
 /// Study configuration, loaded from a JSON file (no extra dependency; `serde_json` only).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +31,199 @@ pub struct StudyConfig {
     /// Background completion deadline measured from gate receipt by the burn child.
     pub background_deadline_secs: Option<f64>,
     pub arms: Vec<String>,
+    /// Matrix plans are validated here and require a matrix-specific runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixConfig {
+    pub stage: MatrixStage,
+    pub seeds_per_session: usize,
+    /// One reserve list per session. Primary session seeds are contiguous chunks of `StudyConfig::seeds`.
+    pub reserve_seeds: Vec<Vec<u64>>,
+    pub deferred_arms: Vec<String>,
+    pub manager_fill_threads: usize,
+    pub cpu_job_duty_cycle: f64,
+    pub workloads: MatrixWorkloads,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixStage {
+    Pilot,
+    Full,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixWorkloads {
+    pub w1: MatrixCpuWorkload,
+    pub w2: MatrixCpuWorkload,
+    pub w3: MatrixInferenceWorkload,
+    pub w4: MatrixTrainingWorkload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixCpuWorkload {
+    pub ping_pong_pairs: usize,
+    pub probe_all_phases: bool,
+    pub p99_slo_ns: u64,
+    pub cpu_job_updates_per_thread: u64,
+    pub background_deadline_secs: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixInferenceWorkload {
+    pub host_threads: usize,
+    pub matmul_mkn: [u32; 3],
+    pub dispatches_per_batch: u32,
+    pub batch_period_ms: u64,
+    pub batch_deadline_ms: u64,
+    pub max_violation_rate: f64,
+    pub warmup_batches: u32,
+    pub cpu_job_updates_per_thread: u64,
+    pub background_deadline_secs: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixTrainingWorkload {
+    pub host_threads: usize,
+    pub batch_size: u32,
+    pub inputs: u32,
+    pub outputs: u32,
+    pub matmuls_per_step: u32,
+    pub learning_rate: f64,
+    pub min_steps_per_sec: f64,
+    pub warmup_steps: u32,
+    pub cpu_job_updates_per_thread: u64,
+    pub background_deadline_secs: f64,
+}
+
+impl MatrixConfig {
+    fn validate(&self, cfg: &StudyConfig) -> Result<(), String> {
+        let sessions = match self.stage {
+            MatrixStage::Pilot => 1,
+            MatrixStage::Full => 2,
+        };
+        if self.seeds_per_session == 0
+            || self.seeds_per_session.checked_mul(sessions) != Some(cfg.seeds.len())
+            || self.reserve_seeds.len() != sessions
+        {
+            return Err(
+                "matrix seeds and reserve lists must match the stage's session count".into(),
+            );
+        }
+        let mut seeds = BTreeSet::new();
+        if cfg
+            .seeds
+            .iter()
+            .chain(self.reserve_seeds.iter().flatten())
+            .any(|&seed| seed == 0 || !seeds.insert(seed))
+        {
+            return Err("matrix primary and reserve seeds must be unique and positive".into());
+        }
+        if cfg.arms != ["native", "static-low", "static-high", "reactive", "oracle"]
+            || self.deferred_arms != ["cost-aware"]
+        {
+            return Err("matrix stage 1 requires five active arms and deferred cost-aware".into());
+        }
+        if cfg.slo_latency_threshold_ns.is_some() || cfg.background_deadline_secs.is_some() {
+            return Err("matrix SLOs must be configured inside matrix.workloads".into());
+        }
+        if cfg.control_tick_ms == 0
+            || cfg.oracle_horizon_secs < cfg.control_tick_ms as f64 / 1000.0
+            || cfg.protect_phases != ["burst", "spike"]
+            || cfg.phase_durations_secs[0] < 3.0 * cfg.oracle_horizon_secs
+            || cfg.phase_durations_secs[2] < 3.0 * cfg.oracle_horizon_secs
+            || cfg.phase_durations_secs[1] == 0.0
+            || cfg.phase_durations_secs[3] == 0.0
+        {
+            return Err(
+                "matrix requires two protected phases and release windows >= 3 horizons".into(),
+            );
+        }
+        if cfg.static_weight != cfg.protected_weight
+            || cfg.reactive_low_weight != cfg.protected_weight
+            || cfg.reactive_high_weight != cfg.free_weight
+            || !(1..100).contains(&cfg.protected_weight)
+            || !(101..=10_000).contains(&cfg.free_weight)
+            || cfg.reactive_latency_threshold_ns <= 0.0
+            || cfg.bg_threads == 0
+            || self.manager_fill_threads == 0
+            || self.cpu_job_duty_cycle != 1.0
+        {
+            return Err(
+                "matrix requires distinct low/default/high weights and a fixed-work CPU job".into(),
+            );
+        }
+
+        let MatrixWorkloads { w1, w2, w3, w4 } = &self.workloads;
+        for (name, updates, deadline) in [
+            (
+                "w1",
+                w1.cpu_job_updates_per_thread,
+                w1.background_deadline_secs,
+            ),
+            (
+                "w2",
+                w2.cpu_job_updates_per_thread,
+                w2.background_deadline_secs,
+            ),
+            (
+                "w3",
+                w3.cpu_job_updates_per_thread,
+                w3.background_deadline_secs,
+            ),
+            (
+                "w4",
+                w4.cpu_job_updates_per_thread,
+                w4.background_deadline_secs,
+            ),
+        ] {
+            if updates == 0 || deadline <= 0.0 || deadline > cfg.phase_durations_secs.iter().sum() {
+                return Err(format!(
+                    "matrix {name} job requires positive work and an in-trial deadline"
+                ));
+            }
+        }
+        if [w1, w2]
+            .iter()
+            .any(|w| w.ping_pong_pairs == 0 || w.p99_slo_ns == 0)
+            || !w1.probe_all_phases
+            || w2.probe_all_phases
+        {
+            return Err(
+                "matrix W1/W2 requires a positive p99 SLO and the declared probe duty".into(),
+            );
+        }
+        if w3.host_threads == 0
+            || w3.matmul_mkn.contains(&0)
+            || w3.dispatches_per_batch == 0
+            || w3.batch_period_ms == 0
+            || w3.batch_deadline_ms == 0
+            || !(0.0..1.0).contains(&w3.max_violation_rate)
+            || w3.warmup_batches == 0
+        {
+            return Err("invalid matrix W3 inference parameters".into());
+        }
+        if w4.host_threads == 0
+            || w4.batch_size == 0
+            || w4.inputs == 0
+            || w4.outputs == 0
+            || w4.matmuls_per_step == 0
+            || w4.learning_rate <= 0.0
+            || w4.min_steps_per_sec <= 0.0
+            || w4.warmup_steps == 0
+        {
+            return Err("invalid matrix W4 training parameters".into());
+        }
+        Ok(())
+    }
 }
 
 const fn schema_version() -> u32 {
@@ -44,10 +237,21 @@ impl StudyConfig {
         Self::parse(&text).map_err(|e| format!("config {}: {e}", path.display()))
     }
 
+    pub fn from_legacy_run_file(path: &Path) -> Result<Self, String> {
+        let cfg = Self::from_file(path)?;
+        if cfg.matrix.is_some() {
+            return Err("this configuration requires a matrix runner".into());
+        }
+        Ok(cfg)
+    }
+
     fn parse(text: &str) -> Result<Self, String> {
         let cfg: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if cfg.schema_version != schema_version() {
-            return Err(format!("unsupported schema_version {}", cfg.schema_version));
+        match (cfg.schema_version, &cfg.matrix) {
+            (1, None) | (2, Some(_)) => {}
+            (1, Some(_)) => return Err("matrix requires schema_version 2".into()),
+            (2, None) => return Err("schema_version 2 requires a matrix object".into()),
+            (version, _) => return Err(format!("unsupported schema_version {version}")),
         }
         if cfg.phase_durations_secs.iter().all(|&secs| secs == 0.0)
             || cfg.phase_durations_secs.iter().any(|&secs| {
@@ -63,6 +267,9 @@ impl StudyConfig {
             .is_some_and(|secs| !secs.is_finite() || secs <= 0.0)
         {
             return Err("background_deadline_secs must be finite and positive".into());
+        }
+        if let Some(matrix) = &cfg.matrix {
+            matrix.validate(&cfg)?;
         }
         Ok(cfg)
     }
@@ -117,6 +324,7 @@ mod tests {
                 "reactive".into(),
                 "oracle".into(),
             ],
+            matrix: None,
         };
         let a = cfg.phase_schedule(7);
         let b = cfg.phase_schedule(7);
@@ -155,6 +363,7 @@ mod tests {
                 "reactive".into(),
                 "oracle".into(),
             ],
+            matrix: None,
         };
         let first = cfg.randomized_arms(5);
         let again = cfg.randomized_arms(5);
@@ -195,7 +404,7 @@ mod tests {
     fn invalid_schema_version_and_deadline_are_rejected() {
         let mut raw: serde_json::Value =
             serde_json::from_str(include_str!("../../configs/oracle-study.json")).unwrap();
-        raw["schema_version"] = 2.into();
+        raw["schema_version"] = 3.into();
         assert!(
             StudyConfig::parse(&raw.to_string())
                 .unwrap_err()
@@ -207,6 +416,58 @@ mod tests {
             StudyConfig::parse(&raw.to_string())
                 .unwrap_err()
                 .contains("background_deadline_secs")
+        );
+    }
+
+    #[test]
+    fn loads_preregistered_matrix_plans_and_keeps_them_out_of_the_legacy_runner() {
+        for (file, stage, seeds_per_session, sessions) in [
+            ("matrix-pilot.json", MatrixStage::Pilot, 6, 1),
+            ("matrix-full.json", MatrixStage::Full, 21, 2),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("configs")
+                .join(file);
+            let cfg = StudyConfig::from_file(&path).unwrap();
+            let matrix = cfg.matrix.unwrap();
+            assert_eq!(matrix.stage, stage);
+            assert_eq!(matrix.seeds_per_session, seeds_per_session);
+            assert_eq!(cfg.seeds.len(), seeds_per_session * sessions);
+            assert_eq!(cfg.phase_durations_secs, [4.0, 2.0, 4.0, 2.0]);
+            assert!(
+                StudyConfig::from_legacy_run_file(&path)
+                    .unwrap_err()
+                    .contains("requires a matrix runner")
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_checks_nested_fields_release_windows_and_seed_uniqueness() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../configs/matrix-pilot.json")).unwrap();
+        raw["matrix"]["workloads"]["w3"]["batch_deadlin"] = 10.into();
+        assert!(
+            StudyConfig::parse(&raw.to_string())
+                .unwrap_err()
+                .contains("unknown field `batch_deadlin`")
+        );
+        raw["matrix"]["workloads"]["w3"]
+            .as_object_mut()
+            .unwrap()
+            .remove("batch_deadlin");
+        raw["phase_durations_secs"][0] = 1.0.into();
+        assert!(
+            StudyConfig::parse(&raw.to_string())
+                .unwrap_err()
+                .contains("release windows")
+        );
+        raw["phase_durations_secs"][0] = 4.0.into();
+        raw["matrix"]["reserve_seeds"][0] = serde_json::json!([1001]);
+        assert!(
+            StudyConfig::parse(&raw.to_string())
+                .unwrap_err()
+                .contains("must be unique")
         );
     }
 }

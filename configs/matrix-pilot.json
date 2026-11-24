@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "session_seed": 20261124,
+  "cores": "2-3",
+  "bg_threads": 18,
+  "phase_durations_secs": [4, 2, 4, 2],
+  "seeds": [1001, 1002, 1003, 1004, 1005, 1006],
+  "control_tick_ms": 50,
+  "oracle_horizon_secs": 0.5,
+  "protect_phases": ["burst", "spike"],
+  "protected_weight": 20,
+  "free_weight": 1000,
+  "static_weight": 20,
+  "reactive_low_weight": 20,
+  "reactive_high_weight": 1000,
+  "reactive_latency_threshold_ns": 500000,
+  "arms": ["native", "static-low", "static-high", "reactive", "oracle"],
+  "matrix": {
+    "stage": "pilot",
+    "seeds_per_session": 6,
+    "reserve_seeds": [[]],
+    "deferred_arms": ["cost-aware"],
+    "manager_fill_threads": 2,
+    "cpu_job_duty_cycle": 1.0,
+    "workloads": {
+      "w1": {
+        "ping_pong_pairs": 1,
+        "probe_all_phases": true,
+        "p99_slo_ns": 2000000,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      },
+      "w2": {
+        "ping_pong_pairs": 1,
+        "probe_all_phases": false,
+        "p99_slo_ns": 2000000,
+        "cpu_job_updates_per_thread": 180000000,
+        "background_deadline_secs": 9.5
+      },
+      "w3": {
+        "host_threads": 1,
+        "matmul_mkn": [128, 128, 128],
+        "dispatches_per_batch": 32,
+        "batch_period_ms": 10,
+        "batch_deadline_ms": 10,
+        "max_violation_rate": 0.01,
+        "warmup_batches": 32,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      },
+      "w4": {
+        "host_threads": 1,
+        "batch_size": 512,
+        "inputs": 512,
+        "outputs": 512,
+        "matmuls_per_step": 3,
+        "learning_rate": 0.001,
+        "min_steps_per_sec": 80,
+        "warmup_steps": 32,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      }
+    }
+  }
+}
