@@ -244,7 +244,7 @@ pub fn run_phased_bench(
         p99_ns: crate::percentile(&latency, 0.99),
         max_ns: *latency.last().unwrap_or(&0),
     };
-    writer.write(&serde_json::json!({"kind":"bench_summary","summary":summary,"seed":config.seed,"effective_cpu_weight":weight,"cgroup":scope.map(|s|s.workload.display().to_string()),"total_seconds":total.as_secs_f64()})).map_err(|e| e.to_string())?;
+    writer.write(&serde_json::json!({"kind":"bench_summary","summary":summary,"seed":config.seed,"effective_cpu_weight":weight,"cgroup":scope.map(|s|s.workload().display().to_string()),"total_seconds":total.as_secs_f64()})).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
     Ok(summary)
 }
@@ -291,7 +291,7 @@ pub fn run_scoped_bench(
     let audit_path = trace.with_extension("audit.jsonl");
     std::fs::File::create(&audit_path).map_err(|e| e.to_string())?;
     let mut whitelist = PathWhitelist::default();
-    whitelist.mark_created(scope.workload.clone());
+    whitelist.mark_created(scope.workload().to_owned());
     let mut controller = WeightController::new(
         FileCgroupIo,
         whitelist,
@@ -300,7 +300,7 @@ pub fn run_scoped_bench(
     );
     let action = ControlAction {
         workload: "phased-cpu-bench".into(),
-        cgroup: scope.workload.clone(),
+        cgroup: scope.workload().to_owned(),
         cpu_weight: weight,
         expires_at_seconds: f64::MAX,
         source: Source::Assumed,
@@ -330,7 +330,7 @@ pub fn run_scoped_bench(
         .restore_all()
         .map_err(|e| format!("cpu.weight restore failed: {e:?}"))?;
     let restored = FileCgroupIo
-        .read_weight(&scope.workload)
+        .read_weight(scope.workload())
         .map_err(|e| e.to_string())?;
     scope
         .remove_workload()

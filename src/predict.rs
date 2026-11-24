@@ -210,7 +210,7 @@ pub fn predict_with_budget(
         && window
             .observations
             .iter()
-            .any(|observation| observation.source == Source::Oracle)
+            .any(|observation| observation.source.is_oracle())
     {
         return Err(PredictError::InvalidTrace(
             "oracle observations are restricted to oracle predictors".into(),

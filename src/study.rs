@@ -11,7 +11,7 @@ use crate::{
     bench::PhaseConfig,
     control::{
         ApplyOptions, CgroupIo, ControlAction, ControlGuards, Controller, DelegatedScope,
-        FileCgroupIo, FuturePhaseController, PathWhitelist, WeightController, unique_unit,
+        FileCgroupIo, FuturePhaseController, unique_unit,
     },
     percentile, write_jsonl,
 };
@@ -208,15 +208,13 @@ pub fn run_controlled_trial(
 
     let audit_path = trace.with_extension("audit.jsonl");
     fs::File::create(&audit_path).map_err(|e| e.to_string())?;
-    let mut whitelist = PathWhitelist::default();
-    whitelist.mark_created(scope.workload.clone());
     // Study action space: full 1..=10000 range, small rate limit so a 50 ms tick can act. Identical per arm.
     let guards = ControlGuards {
         max_delta: 10_000,
         min_background_weight: 1,
         max_frequency: Duration::from_millis(20),
     };
-    let mut controller = WeightController::new(FileCgroupIo, whitelist, guards, audit_path.clone());
+    let mut controller = scope.study_weight_controller(guards, audit_path.clone());
 
     let plan = config
         .durations
@@ -256,7 +254,7 @@ pub fn run_controlled_trial(
     let mut policy = ArmPolicy::from_name(arm_name, cfg, oracle_trace)?;
     // Seed the applied weight so arms that want a non-default value act on the first tick.
     let mut last_applied: Option<u32> =
-        Some(FileCgroupIo.read_weight(&scope.workload).unwrap_or(100));
+        Some(FileCgroupIo.read_weight(scope.workload()).unwrap_or(100));
 
     let mut latency: Vec<u128> = Vec::new();
     let mut phase_lat: std::collections::BTreeMap<String, Vec<u128>> = Default::default();
@@ -265,7 +263,7 @@ pub fn run_controlled_trial(
     let mut weight_switches = 0usize;
 
     let mut writer = JsonlWriter::append(trace).map_err(|e| e.to_string())?;
-    let usage_before = read_usage_usec(&scope.workload);
+    let usage_before = read_usage_usec(scope.workload());
     let tick = Duration::from_millis(cfg.control_tick_ms.max(1));
 
     for (idx, phase) in config.names.iter().enumerate() {
@@ -301,9 +299,19 @@ pub fn run_controlled_trial(
                 {
                     recent.pop_front();
                 }
-                let desired: Option<u32> = match &mut policy {
+                let decision_started_seconds = crate::monotonic_seconds();
+                let action_for_weight = |cpu_weight, source| ControlAction {
+                    workload: "study".into(),
+                    cgroup: scope.workload().to_owned(),
+                    cpu_weight,
+                    expires_at_seconds: f64::INFINITY,
+                    source,
+                };
+                let desired = match &mut policy {
                     ArmPolicy::Native => None,
-                    ArmPolicy::Static { weight } => Some(*weight),
+                    ArmPolicy::Static { weight } => {
+                        Some(action_for_weight(*weight, Source::Assumed))
+                    }
                     ArmPolicy::Reactive {
                         low,
                         high,
@@ -317,7 +325,10 @@ pub fn run_controlled_trial(
                             // Feedback on the measured latency tail (median stays at the syscall floor
                             // even when foreground is starved; the p90 of recent samples reveals it).
                             let signal = crate::percentile(&win, 0.9) as f64;
-                            Some(if signal > *threshold_ns { *low } else { *high })
+                            Some(action_for_weight(
+                                if signal > *threshold_ns { *low } else { *high },
+                                Source::Observed,
+                            ))
                         }
                     }
                     ArmPolicy::Oracle(ctl) => {
@@ -329,22 +340,14 @@ pub fn run_controlled_trial(
                                 monotonic_seconds: crate::monotonic_seconds(),
                                 source: Source::Observed,
                             },
-                            &scope.workload,
+                            scope.workload(),
                         )
-                        .map(|a| a.cpu_weight)
                     }
                 };
 
-                if let Some(w) = desired
-                    && last_applied != Some(w)
+                if let Some(action) = desired
+                    && last_applied != Some(action.cpu_weight)
                 {
-                    let action = ControlAction {
-                        workload: "study".into(),
-                        cgroup: scope.workload.clone(),
-                        cpu_weight: w,
-                        expires_at_seconds: f64::INFINITY,
-                        source: Source::Assumed,
-                    };
                     match controller.apply(
                         &action,
                         ApplyOptions {
@@ -352,6 +355,7 @@ pub fn run_controlled_trial(
                             is_background: false,
                             now_seconds: crate::monotonic_seconds(),
                         },
+                        decision_started_seconds,
                     ) {
                         Ok(res) => {
                             control_actions += 1;
@@ -375,7 +379,7 @@ pub fn run_controlled_trial(
 
     drop(ping);
     let _ = echo_thread.join();
-    let usage_after = read_usage_usec(&scope.workload);
+    let usage_after = read_usage_usec(scope.workload());
     controller
         .restore_all()
         .map_err(|e| format!("restore: {e:?}"))?;
