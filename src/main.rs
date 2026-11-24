@@ -143,7 +143,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let text = std::fs::read_to_string(&input)?;
             let mut lines = text.lines();
             let header: serde_json::Value = serde_json::from_str(lines.next().unwrap_or("{}"))?;
-            let sample_count = lines.count();
             println!(
                 "file={} samples={} host={} arch={} kernel={} seed={} command={}",
                 input.display(),
@@ -151,7 +150,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 header["host"],
                 header["architecture"],
                 header["kernel"],
-                header["seed"],
                 header["command"]
             );
             println!("capabilities={}", header["capabilities"]);
