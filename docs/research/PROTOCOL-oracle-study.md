@@ -172,5 +172,13 @@ emitted by the same binary (`study analyze`) so CIs are reproducible without ext
 
 ## 12. Amendments
 
-_None yet._ Any change after this commit appends here with date, reason, and the affected section; the
-original text above is never edited in place.
+**Amendment A1 — 2026-11-24 (before any trial).** `protect_phases` for the Oracle arm is finalized to
+`["burst","steady","spike"]` (all non-idle high-duty phases), not just burst/spike as sketched in §2.
+Reason: a pre-registration pilot (throwaway, `/tmp`, never scored) showed steady-phase duty cycles of
+0.35–0.65 with 18 background threads on two cores also drive foreground p99 into the multi-millisecond
+range at free weight, so protecting only burst/spike would leave a large unprotected tail and confound
+the end-to-end metric with arm-coverage rather than foresight. This finalizes the *arm design* before any
+scored trial is run; it does not touch §8's threshold or any metric definition. The Oracle-vs-Static(H3)
+contrast still isolates prediction's marginal value: Static holds weight low for the whole run, Oracle
+releases background weight during idle and re-protects ahead of each high-duty phase.
+
