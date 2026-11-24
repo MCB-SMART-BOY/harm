@@ -1,17 +1,18 @@
 // Usage: taskset -c 4 bun experiments/matrix-pilot-2.ts MODE BINARY CONFIG OUTPUT
-// Modes: calibrate, stress, pilot, stress-a3, stress-a4. Each mode writes to a fresh subdirectory.
+// Modes: calibrate, stress, pilot, stress-a3, stress-a4, prepare-a4-A/B, session-a4-A/B.
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 const [mode, executable, configPath, output] = Bun.argv.slice(2);
-if (!["calibrate", "stress", "pilot", "stress-a3", "stress-a4"].includes(mode) || !executable || !configPath || !output)
+const scored = /^(prepare|session)-a4-(A|B)$/.exec(mode);
+if ((!scored && !["calibrate", "stress", "pilot", "stress-a3", "stress-a4"].includes(mode)) || !executable || !configPath || !output)
   throw new Error("expected MODE BINARY CONFIG OUTPUT");
 const binary = resolve(executable);
 const cfgPath = resolve(configPath);
 const cfg = await Bun.file(cfgPath).json();
 const scoredStress = mode === "stress-a3" || mode === "stress-a4";
-if (cfg.matrix.stage !== (scoredStress ? "full" : "pilot"))
-  throw new Error("stress-a3 and stress-a4 require the scored config; other modes require the pilot config");
+if (cfg.matrix.stage !== (scoredStress || scored ? "full" : "pilot"))
+  throw new Error("expected the registered config for this mode");
 const dir = resolve(output, mode);
 mkdirSync(dir);
 const classes = ["w1", "w2", "w3", "w4"];
@@ -42,6 +43,16 @@ const signature = (loaded: LoadedModel[]) => {
   return JSON.stringify([identifier, modelKey, sizeBytes, contextLength, lastUsedTime, modelStat()]);
 };
 const initial = signature(models());
+const binarySha = command("sha256sum", binary).split(" ")[0];
+if (scored) {
+  const gate = JSON.parse(readFileSync(resolve(output, "stage0-a4.json"), "utf8"));
+  if (gate.stage_0_pass !== true) throw new Error("A4 Stage 0 must pass before a scored run");
+  const stressRoot = resolve(output, "stress-a4");
+  const run = JSON.parse(readFileSync(resolve(stressRoot, "run.jsonl"), "utf8").split("\n")[0]);
+  if (run.sha256 !== binarySha || JSON.stringify(run.config) !== JSON.stringify(cfg)) {
+    throw new Error("scored run requires the binary and config used in Stage 0");
+  }
+}
 function check() {
   const loaded = models();
   const current = signature(loaded);
@@ -58,8 +69,30 @@ function snapshot(label: string) {
     lms_ps: command("timeout", "5s", "lms", "ps"), free_g: command("free", "-g"),
     loadavg: read("/proc/loadavg"),
     psi: Object.fromEntries(["cpu", "memory", "io"].map(type => [type, read(`/proc/pressure/${type}`)])),
-    ...(scoredStress ? { temperatures_c: Object.fromEntries(temperatures()) } : {}),
+    ...(scoredStress || scored ? {
+      temperatures_c: Object.fromEntries(temperatures()),
+      kernel: read("/proc/sys/kernel/osrelease"),
+      power_profile: optionalRead("/sys/firmware/acpi/platform_profile"),
+      ac_online: optionalRead("/sys/class/power_supply/AC0/online"),
+      cpu_governors: [0, 1, 2, 3].map(cpu =>
+        optionalRead(`/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor`)),
+      gpu_state: optionalCommand("timeout", "5s", "nvidia-smi",
+        "--query-gpu=name,driver_version,temperature.gpu,clocks.sm,pstate", "--format=csv,noheader"),
+    } : {}),
   });
+}
+
+function optionalCommand(...args: string[]) {
+  const result = Bun.spawnSync(args);
+  return result.exitCode === 0 ? result.stdout.toString().trimEnd() : null;
+}
+
+function optionalRead(path: string) {
+  try {
+    return read(path);
+  } catch {
+    return null;
+  }
 }
 
 function temperatures() {
@@ -108,6 +141,24 @@ function guard() {
   if (excursion) throw excursion;
   check();
 }
+async function waitForBaseline() {
+  await Bun.sleep(60_000);
+  guard();
+  const baseline = temperatures();
+  log("run", { temperatures_c: Object.fromEntries(baseline) });
+  return async () => {
+    const start = performance.now();
+    await Bun.sleep(15_000);
+    for (;;) {
+      guard();
+      const current = temperatures();
+      const elapsed = performance.now() - start;
+      if ([...baseline].every(([id, base]) => (current.get(id) ?? Infinity) <= base + 3)) return elapsed;
+      if (elapsed >= 120_000) throw new Error("temperature did not return within 3 °C of baseline in 120s");
+      await Bun.sleep(Math.min(5000, 120_000 - elapsed));
+    }
+  };
+}
 async function launch(args: string[], description: object) {
   guard();
   const start = performance.now();
@@ -128,7 +179,7 @@ async function smoke(className: string, arm: string, seed: number, session: stri
 
 try {
   snapshot("before");
-  log("run", { mode, binary, sha256: command("sha256sum", binary).split(" ")[0], config: cfg, pid });
+  log("run", { mode, binary, sha256: binarySha, config: cfg, pid });
   if (mode === "calibrate") {
     // The kernel continues at full duty after the quota. Measure total updates
     // over the fixed observation window, independent of any completion time.
@@ -158,25 +209,33 @@ try {
     const scopes = command("systemctl", "--user", "list-units", "harm-*.scope", "--no-legend", "--plain");
     log("run", { remaining_scopes: scopes, kernel: command("uname", "-r") });
     if (scopes) throw new Error(`HARM scopes remain after stress: ${scopes}`);
+  } else if (scored) {
+    const [, stage, session] = scored;
+    const oracleDir = resolve(output, `prepare-a4-${session}`, "references");
+    if (stage === "prepare") {
+      const index = session === "A" ? 0 : 1;
+      const n = cfg.matrix.seeds_per_session;
+      const seeds = [...cfg.seeds.slice(index * n, (index + 1) * n), ...cfg.matrix.reserve_seeds[index]];
+      const cooldown = await waitForBaseline();
+      for (const seed of seeds) {
+        const cooldown_ms = await cooldown();
+        const status = await launch(["record-traces", "--workload", "w1", "--seed", `${seed}`,
+          "--config", cfgPath, "--out-dir", oracleDir],
+          { kind: "reference", class: "w1", seed, cooldown_ms });
+        if (status !== 0) throw new Error(`invalid W1 ${seed} Oracle reference`);
+      }
+    } else {
+      const status = await launch(["run", "--session", session, "--trials-dir", resolve(output, "sessions"),
+        "--oracle-trace-dir", oracleDir, "--config", cfgPath,
+        "--matrix-pilot-report", resolve(output, "pilot-w1-a4.json"),
+        "--llm-state", "LM Studio resident-idle, no generation", "--llm-pid", pid],
+        { kind: "session", session });
+      if (status !== 0) throw new Error(`scored session ${session} exited ${status}`);
+    }
   } else {
     // Use class batches as in the first pilot. Preserve the randomized arm order
     // within each matched block and capture a residency record at every boundary.
-    await Bun.sleep(60_000);
-    guard();
-    const baseline = temperatures();
-    log("run", { temperatures_c: Object.fromEntries(baseline) });
-    const cooldown = async () => {
-      const start = performance.now();
-      await Bun.sleep(15_000);
-      for (;;) {
-        guard();
-        const current = temperatures();
-        const elapsed = performance.now() - start;
-        if ([...baseline].every(([id, base]) => (current.get(id) ?? Infinity) <= base + 3)) return elapsed;
-        if (elapsed >= 120_000) throw new Error("temperature did not return within 3 °C of baseline in 120s");
-        await Bun.sleep(Math.min(5000, 120_000 - elapsed));
-      }
-    };
+    const cooldown = await waitForBaseline();
     for (const [classIndex, className] of classes.entries()) {
       snapshot(`before ${className}`);
       const classStart = performance.now();

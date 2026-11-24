@@ -2,6 +2,78 @@
 
 Date of this audit: 2026-11-25, Asia/Shanghai.
 
+## A4 controller isolation and apply-time expiry (2026-11-25)
+
+The A3 trial process inherited CPUs 2–3 before forking the competing
+workload and starting the foreground probes, fillers, controller, and
+observer. This left the controller sharing two logical CPUs with the 18
+nice +10 competing workers. The controller remains part of the system under
+test. Co-locating it with the load makes timing voids depend on how often
+an arm writes and biases complete-block yield. A deployment can allocate
+CPU capacity to control separately. A4 pins the existing controller and
+observer thread to CPUs 0–1 after starting the workloads. The foreground,
+manager fillers, and batch workers retain CPUs 2–3. A live `/proc` check
+in the A4 stress series verified those masks and the workload nice values.
+
+The regression against A3 verified a write from 100 to 200 after the
+proposal expired because the caller's clock sample preceded expiry.
+The patched actuator reads its own monotonic clock on entry and again
+before a live write. For the matrix it checks the exact gate-based
+deadline. The caller's timestamp remains in the audit. The measured
+effective time is verified readback, which can still land beyond expiry
+if the write and readback straddle the deadline. A3's stale-apply and
+initial-apply void rules remain in force.
+
+### Historical pilot re-audit
+
+Reprocessing all 120 retained pilot verdicts under A3 and reconstructing
+A4 timing metrics reproduced the A3 arm void counts of 0, 0, 0, 4, and 3
+out of 24 per arm and 17/24 complete blocks across W1–W4. W1 had
+4/6 complete blocks and both Oracle voids, with one initial-window
+miss. The W1 burst, spike, and CPU deadline thresholds had respectively
+14/14, 12/16, and 18/10 pass/miss counts across 28 valid trials.
+W2–W4 still fail §5 headroom. The historical trials used the original
+CPU placement. The A4 yield estimate uses the historical W1 Native
+and Static rates and the new rates for the two dynamic arms.
+
+### Stage 0 verdict
+
+**PASS.** Both affected arms had 20/20 valid W1 stress trials at the scored
+parameters. The historical W1 Native, Static-low, and Static-high arms
+each had 6/6 valid trials. All five estimated own-arm void rates are 0%,
+so the point estimate is **27 of 27** complete blocks. This is an estimate
+from separate trial series rather than an observed complete-block rate.
+The fresh stress series recorded zero initial-window misses in 40
+trials, zero stale verified writes, and zero ticks starting at or beyond
+50 ms. The existing 50 ms initial window applies to the scored sessions.
+
+| W1 stress arm | Own-arm voids | Expired proposals | Forecasts tied to expired proposals | Tick lateness p99 / max | Apply→readback p99 / max |
+|---|---:|---:|---:|---:|---:|
+| Reactive | 0/20 | 0/1846 | Unavailable (0 forecasts) | 0.357 / 0.479 ms | 0.608 / 0.702 ms |
+| Oracle | 0/20 | 0/80 | 0/4800 | 0.345 / 0.693 ms | 0.601 / 0.601 ms |
+
+The series ran from 04:04:17 to 04:13:59 local time with LM Studio
+resident-idle on kernel `7.3.0-78-omarchy`. Snapshots retained the same
+idle `qwen3.8-flash-next@iq4_xs` PID, model signature, and last-use time
+with an empty queue. CPU sensors ranged from 38 to 47 °C and GPU
+temperature from 43 to 45 °C at the sampled boundaries. Available RAM
+and used swap at the boundaries were 4 GiB and 37 GiB. The final scope
+check found zero remaining HARM scopes. The release SHA-256 was
+`7ad5297261f022a32a70faa67f844bf14011b33929214a076eed650245fc6352`.
+The series used consecutive feasibility trials, each with its own
+delegated scope, and one fresh W1/2001 Native reference. The scored
+sessions use the registered cooldowns, seeds, and reserves.
+
+The ledgers, environment records, masks, and traces are in
+`~/Projects/harm/experiments/data/h1-a4-20261125.Yf9SPc/`. Reproduce the
+Stage-0 ledger with:
+
+```sh
+data="$HOME/Projects/harm/experiments/data"
+bun experiments/matrix-a3-audit.ts "$data/matrix-pilot-2/pilot" \
+  "$data/h1-a4-20261125.Yf9SPc/stress-a4" --a4
+```
+
 ## A3 re-audit and H1 verdict (2026-11-25)
 
 **Stage 0 FAIL. H1 gate FAIL at the validity prerequisite.** The A3 pilot
