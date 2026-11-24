@@ -3,6 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytemuck::cast_slice;
+use gpu_probe::{EPSILON, cpu_matmul, max_abs_error, open_device, vulkan_adapters};
 use wgpu::util::DeviceExt;
 
 const M: usize = 128;
@@ -12,7 +13,6 @@ const GPU_SECONDS: f64 = 5.0;
 const POWER_SECONDS: f64 = 5.0;
 const POWER_INTERVAL: Duration = Duration::from_millis(200);
 const DISPATCHES_PER_BATCH: u32 = 32;
-const EPSILON: f32 = 1.0e-3;
 
 #[derive(Debug, Clone)]
 struct PowerSample {
@@ -28,7 +28,7 @@ fn main() -> Result<(), String> {
         arithmetic_intensity()
     );
 
-    let adapters = enumerate_adapters()?;
+    let adapters = vulkan_adapters();
     if adapters.is_empty() {
         return Err(
             "wgpu could not enumerate a Vulkan adapter: adapter list was empty".to_string(),
@@ -53,15 +53,7 @@ fn main() -> Result<(), String> {
         selected.name, selected.backend, selected.driver, selected.driver_info
     );
 
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("gpu-probe device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::downlevel_defaults(),
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-    }))
-    .map_err(|error| format!("wgpu request_device failed: {error}"))?;
+    let (device, queue) = open_device(adapter)?;
 
     let gpu = GpuMatmul::new(&device, &queue);
     let cpu_input = deterministic_input(M * K);
@@ -116,23 +108,6 @@ fn main() -> Result<(), String> {
     );
 
     Ok(())
-}
-
-fn enumerate_adapters() -> Result<Vec<wgpu::Adapter>, String> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..Default::default()
-    });
-    let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
-    if adapters.is_empty() {
-        println!("wgpu_enumeration_error=Vulkan adapter list was empty");
-    } else {
-        println!(
-            "wgpu_enumeration=ok backend=Vulkan adapter_count={}",
-            adapters.len()
-        );
-    }
-    Ok(adapters)
 }
 
 struct GpuMatmul {
@@ -420,28 +395,6 @@ fn deterministic_input(length: usize) -> Vec<f32> {
             value / 10_000.0 - 0.5
         })
         .collect()
-}
-
-fn cpu_matmul(left: &[f32], right: &[f32], rows: usize, inner: usize, columns: usize) -> Vec<f32> {
-    let mut output = vec![0.0; rows * columns];
-    for row in 0..rows {
-        for column in 0..columns {
-            let mut sum = 0.0;
-            for depth in 0..inner {
-                sum += left[row * inner + depth] * right[depth * columns + column];
-            }
-            output[row * columns + column] = sum;
-        }
-    }
-    output
-}
-
-fn max_abs_error(expected: &[f32], actual: &[f32]) -> f32 {
-    expected
-        .iter()
-        .zip(actual)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max)
 }
 
 fn arithmetic_intensity() -> f64 {

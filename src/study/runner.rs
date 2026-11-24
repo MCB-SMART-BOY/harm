@@ -166,6 +166,7 @@ pub fn run_controlled_trial(
     order_index: usize,
     oracle_trace: Option<&Path>,
 ) -> Result<TrialSummary, String> {
+    require_legacy(cfg)?;
     let config = cfg.phase_schedule(seed);
     let total: Duration = config.durations.iter().copied().sum();
     if total.is_zero() {
@@ -421,6 +422,7 @@ pub fn launch_trial(
     trace: &Path,
     oracle_trace_dir: &Path,
 ) -> Result<(), String> {
+    require_legacy(cfg)?;
     let unit = unique_unit();
     let mut args: Vec<String> = vec![
         "__study-trial".into(),
@@ -544,6 +546,7 @@ pub fn run_trial_in_scope(
 
 /// These files are the only future input the Oracle arm may read (protocol §7).
 pub fn record_traces(cfg: &StudyConfig, cfg_path: &Path, out_dir: &Path) -> Result<(), String> {
+    require_legacy(cfg)?;
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let exe = exe()?;
     for &seed in &cfg.seeds {
@@ -577,6 +580,7 @@ pub fn run_session(
     trials_dir: &Path,
     oracle_trace_dir: &Path,
 ) -> Result<(), String> {
+    require_legacy(cfg)?;
     fs::create_dir_all(trials_dir).map_err(|e| e.to_string())?;
     let exe = exe()?;
     for &seed in &cfg.seeds {
@@ -609,6 +613,13 @@ pub fn run_session(
 
 fn exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())
+}
+
+fn require_legacy(cfg: &StudyConfig) -> Result<(), String> {
+    if cfg.schema_version != 1 || cfg.matrix.is_some() {
+        return Err("this configuration requires a matrix runner".into());
+    }
+    Ok(())
 }
 
 /// Actuator power check (protocol §6): same workload shape, static weight held for the whole run at
