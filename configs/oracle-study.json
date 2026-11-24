@@ -1,0 +1,17 @@
+{
+  "session_seed": 20261124,
+  "cores": "2-3",
+  "bg_threads": 18,
+  "phase_durations_secs": [0.8, 1.2, 1.0, 1.5],
+  "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+  "control_tick_ms": 50,
+  "oracle_horizon_secs": 1.0,
+  "protect_phases": ["burst", "steady", "spike"],
+  "protected_weight": 20,
+  "free_weight": 1000,
+  "static_weight": 20,
+  "reactive_low_weight": 20,
+  "reactive_high_weight": 1000,
+  "reactive_latency_threshold_ns": 500000.0,
+  "arms": ["native", "static", "reactive", "oracle"]
+}

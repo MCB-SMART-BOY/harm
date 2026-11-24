@@ -4,7 +4,7 @@ use harm::{
     bench::{burn_blocked_child, launch_scoped_bench, phase_duration_args, run_scoped_bench},
     capabilities,
     control::{launch_delegated, run_control_experiment, unique_unit},
-    metadata, sample_with_gpu_probe,
+    metadata, sample_with_gpu_probe, study,
     telemetry::BoundedRing,
     write_jsonl,
 };
@@ -57,6 +57,35 @@ enum Command {
         #[command(subcommand)]
         command: ControlCommand,
     },
+    Study {
+        #[command(subcommand)]
+        command: StudyCommand,
+    },
+    ActuatorPower {
+        #[arg(long, default_value = "configs/oracle-study.json")]
+        config: PathBuf,
+        #[arg(long, default_value = "experiments/data/actuator")]
+        out_dir: PathBuf,
+    },
+    #[command(name = "__study-trial", hide = true)]
+    InternalStudyTrial {
+        #[arg(long)]
+        unit: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        arm: String,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        order_index: usize,
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long)]
+        oracle_trace: Option<PathBuf>,
+    },
     #[command(name = "__control", hide = true)]
     InternalControl {
         #[arg(long)]
@@ -106,6 +135,29 @@ enum ControlCommand {
         audit: PathBuf,
         #[arg(long, default_value_t = 300)]
         workload_ms: u64,
+    },
+}
+#[derive(Subcommand)]
+enum StudyCommand {
+    RecordTraces {
+        #[arg(long, default_value = "configs/oracle-study.json")]
+        config: PathBuf,
+        #[arg(long, default_value = "experiments/data/traces")]
+        out_dir: PathBuf,
+    },
+    Run {
+        #[arg(long, default_value = "configs/oracle-study.json")]
+        config: PathBuf,
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value = "experiments/data/study")]
+        trials_dir: PathBuf,
+        #[arg(long, default_value = "experiments/data/traces")]
+        oracle_trace_dir: PathBuf,
+    },
+    Analyze {
+        #[arg(long)]
+        dir: PathBuf,
     },
 }
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -259,6 +311,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     workload_ms,
                 },
         } => launch_control(weight, &audit, workload_ms).map_err(std::io::Error::other)?,
+        Command::Study { command } => match command {
+            StudyCommand::RecordTraces { config, out_dir } => {
+                let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                study::record_traces(&cfg, &config, &out_dir).map_err(std::io::Error::other)?
+            }
+            StudyCommand::Run {
+                config,
+                session,
+                trials_dir,
+                oracle_trace_dir,
+            } => {
+                let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                study::run_session(&cfg, &config, &session, &trials_dir, &oracle_trace_dir)
+                    .map_err(std::io::Error::other)?
+            }
+            StudyCommand::Analyze { dir } => {
+                let results = study::analyze(&dir, None).map_err(std::io::Error::other)?;
+                for r in &results {
+                    println!(
+                        "{}",
+                        serde_json::to_string(r).map_err(std::io::Error::other)?
+                    );
+                }
+            }
+        },
+        Command::ActuatorPower { config, out_dir } => {
+            let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+            study::run_actuator_power(&cfg, &config, &out_dir).map_err(std::io::Error::other)?
+        }
+        Command::InternalStudyTrial {
+            unit,
+            config,
+            arm,
+            seed,
+            session,
+            order_index,
+            trace,
+            oracle_trace,
+        } => study::run_trial_in_scope(
+            &unit,
+            &config,
+            &arm,
+            seed,
+            &session,
+            order_index,
+            &trace,
+            oracle_trace.as_deref(),
+        )
+        .map_err(std::io::Error::other)?,
         Command::InternalControl {
             unit,
             weight,

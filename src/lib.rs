@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 pub mod bench;
 pub mod control;
 pub mod predict;
+pub mod study;
 pub mod telemetry;
+pub mod trace;
 use std::{
     fs,
     io::{self, BufWriter, Write},

@@ -131,6 +131,69 @@ impl OracleController {
     }
 }
 
+/// Study Oracle for the Phase 3 upper-bound experiment. Its future knowledge comes *only* from a
+/// pre-recorded [`FutureTrace`] file; its present knowledge is only `observation.monotonic_seconds`.
+/// It never reads live PSI, load, or the current weight to infer the future — so it cannot leak runtime
+/// state into its decision. Ahead of each protected phase (a high-duty label scheduled in the trace) it
+/// lowers background weight; during unprotected phases it raises it back.
+pub struct FuturePhaseController {
+    trace: crate::trace::FutureTrace,
+    horizon_seconds: f64,
+    protect_phases: std::collections::HashSet<String>,
+    protected_weight: u32,
+    free_weight: u32,
+}
+
+impl FuturePhaseController {
+    pub fn from_trace_file(
+        path: &Path,
+        horizon_seconds: f64,
+        protect_phases: Vec<String>,
+        protected_weight: u32,
+        free_weight: u32,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            trace: crate::trace::FutureTrace::from_file(path)?,
+            horizon_seconds,
+            protect_phases: protect_phases.into_iter().collect(),
+            protected_weight,
+            free_weight,
+        })
+    }
+
+    /// The weight the controller wants at monotonic time `now`. It protects background when either the
+    /// phase active *now* or the phase active at `now + horizon` is a protected (high-duty) label — so it
+    /// lowers weight ahead of an upcoming transition and keeps protecting through the final recorded phase
+    /// even once the horizon runs past the end of the trace. Outside any recorded phase there is no known
+    /// future, so it falls back to the free weight rather than guessing. Uses only file data + present clock.
+    pub fn desired_weight(&self, now: f64) -> u32 {
+        let protected = |t: f64| {
+            self.trace
+                .phase_at(t)
+                .is_some_and(|p| self.protect_phases.contains(&p.phase))
+        };
+        if protected(now + self.horizon_seconds) || protected(now) {
+            self.protected_weight
+        } else {
+            self.free_weight
+        }
+    }
+}
+
+impl Controller for FuturePhaseController {
+    fn decide(&mut self, o: &ControlObservation, path: &Path) -> Option<ControlAction> {
+        // Only the present monotonic clock is read from the observation; no live metric influences it.
+        let weight = self.desired_weight(o.monotonic_seconds);
+        Some(ControlAction {
+            workload: o.workload.clone(),
+            cgroup: path.into(),
+            cpu_weight: weight,
+            expires_at_seconds: f64::INFINITY,
+            source: Source::Assumed, // study-only; provenance is not Oracle so the guard can apply it
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlError {
     Unavailable(String),
@@ -1142,6 +1205,86 @@ mod tests {
         let oracle_action = oracle.decide(&observation, &path).unwrap();
         assert_eq!(oracle_action.source, Source::Oracle);
         assert_eq!(oracle_action.cpu_weight, 1000);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- FuturePhaseController: the study Oracle. Must use only the trace + present clock. ---
+
+    fn timeline_trace(dir: &Path) -> PathBuf {
+        // idle [0,0.8), burst [0.8,2.0), steady [2.0,3.0), spike [3.0,4.5). Protect burst+spike.
+        let trace = dir.join("future-timeline.jsonl");
+        fs::write(
+            &trace,
+            concat!(
+                "{\"kind\":\"phase\",\"phase\":\"idle\",\"monotonic_seconds\":0.0,\"duration_seconds\":0.8,\"duty_cycle\":0.05}\n",
+                "{\"kind\":\"phase\",\"phase\":\"burst\",\"monotonic_seconds\":0.8,\"duration_seconds\":1.2,\"duty_cycle\":0.9}\n",
+                "{\"kind\":\"phase\",\"phase\":\"steady\",\"monotonic_seconds\":2.0,\"duration_seconds\":1.0,\"duty_cycle\":0.5}\n",
+                "{\"kind\":\"phase\",\"phase\":\"spike\",\"monotonic_seconds\":3.0,\"duration_seconds\":1.5,\"duty_cycle\":0.98}\n",
+            ),
+        )
+        .unwrap();
+        trace
+    }
+
+    fn study_oracle(dir: &Path) -> FuturePhaseController {
+        FuturePhaseController::from_trace_file(
+            &timeline_trace(dir),
+            1.0, // horizon: look one second ahead
+            vec!["burst".into(), "spike".into()],
+            20,   // protected weight (foreground-protective)
+            1000, // free weight
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn future_oracle_reacts_ahead_of_transition() {
+        let dir = test_dir("future-oracle-ahead");
+        let ctl = study_oracle(&dir);
+        // At t=0.5 the *current* phase is idle, but one second ahead (t=1.5) is burst -> protect now.
+        assert_eq!(
+            ctl.desired_weight(0.5),
+            20,
+            "must lower weight before burst begins at 0.8"
+        );
+        // Deep inside idle with no protected phase in horizon -> free weight.
+        assert_eq!(ctl.desired_weight(-0.4), 1000); // t+horizon=0.6 still idle
+        // Inside the final spike (t=3.5) it keeps protecting even though +1s is past the trace end,
+        // because the *current* recorded phase is protected — no extrapolation, just present knowledge.
+        assert_eq!(
+            ctl.desired_weight(3.5),
+            20,
+            "must protect through the final recorded phase"
+        );
+        assert_eq!(ctl.desired_weight(4.4), 20); // still inside spike [3.0,4.5)
+        // Past the whole timeline there is no known future -> free weight (never invents a phase).
+        assert_eq!(ctl.desired_weight(4.6), 1000);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_oracle_decision_ignores_live_state() {
+        // Leakage proof: the decision is invariant to every live field (psi, current weight, source)
+        // and still produced when no live metric exists at all (psi = None). Only monotonic time matters.
+        let dir = test_dir("future-oracle-no-live");
+        let path = dir.join("workload");
+        let mut ctl = study_oracle(&dir);
+        let base = ControlObservation {
+            workload: "bg".into(),
+            psi_cpu_some_avg10: None, // no live pressure available at all
+            current_weight: 7,        // garbage
+            monotonic_seconds: 0.5,
+            source: Source::Observed,
+        };
+        let a = ctl.decide(&base, &path).expect("decides with psi=None");
+        assert_eq!(a.cpu_weight, 20);
+        for (psi, w) in [(Some(0.0), 1u32), (Some(99.0), 10_000u32)] {
+            let mut o = base.clone();
+            o.psi_cpu_some_avg10 = psi;
+            o.current_weight = w;
+            o.source = Source::Predicted;
+            assert_eq!(ctl.decide(&o, &path).unwrap().cpu_weight, a.cpu_weight);
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }
