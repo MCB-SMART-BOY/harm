@@ -1,0 +1,4 @@
+{"kind":"phase","phase":"idle","monotonic_seconds":1.12e-7,"duration_seconds":0.8,"duty_cycle":0.020000000004693597,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"burst","monotonic_seconds":0.800013733,"duration_seconds":1.2,"duty_cycle":0.715625968927453,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"steady","monotonic_seconds":2.000846504,"duration_seconds":1.0,"duty_cycle":0.5317803177585639,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"spike","monotonic_seconds":3.003950705,"duration_seconds":1.5,"duty_cycle":0.9958327592195352,"seed":1,"threads":18,"cpu_weight":100}

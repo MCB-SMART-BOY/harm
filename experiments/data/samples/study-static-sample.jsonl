@@ -1,0 +1,7 @@
+{"arm":"static","bg_threads":18,"control_tick_ms":50,"cores":"2-3","kind":"trial_meta","order_index":0,"phase_durations_secs":[0.8,1.2,1.0,1.5],"seed":1,"session":"A"}
+{"kind":"phase","phase":"idle","monotonic_seconds":8e-8,"duration_seconds":0.8,"duty_cycle":0.020000000004693597,"seed":1,"threads":18,"cpu_weight":100}
+{"cpu_weight":20,"kind":"weight","monotonic_seconds":0.000381547}
+{"kind":"phase","phase":"burst","monotonic_seconds":0.800004524,"duration_seconds":1.2,"duty_cycle":0.715625968927453,"seed":1,"threads":18,"cpu_weight":20}
+{"kind":"phase","phase":"steady","monotonic_seconds":2.00000963,"duration_seconds":1.0,"duty_cycle":0.5317803177585639,"seed":1,"threads":18,"cpu_weight":20}
+{"kind":"phase","phase":"spike","monotonic_seconds":3.000013973,"duration_seconds":1.5,"duty_cycle":0.9958327592195352,"seed":1,"threads":18,"cpu_weight":20}
+{"kind":"trial_summary","arm":"static","seed":1,"session":"A","order_index":0,"samples":349686,"p50_ns":7152,"p95_ns":7680,"p99_ns":10480,"max_ns":12277742,"background_cpu_usec":5858679,"control_actions":1,"weight_switches":1,"phase_p99_ns":{"burst":11216,"idle":10768,"spike":9615,"steady":12416}}

@@ -1,0 +1,6 @@
+{"arm":"native","bg_threads":18,"control_tick_ms":50,"cores":"2-3","kind":"trial_meta","order_index":2,"phase_durations_secs":[0.8,1.2,1.0,1.5],"seed":1,"session":"A"}
+{"kind":"phase","phase":"idle","monotonic_seconds":8e-8,"duration_seconds":0.8,"duty_cycle":0.020000000004693597,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"burst","monotonic_seconds":0.800004268,"duration_seconds":1.2,"duty_cycle":0.715625968927453,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"steady","monotonic_seconds":2.002612027,"duration_seconds":1.0,"duty_cycle":0.5317803177585639,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"phase","phase":"spike","monotonic_seconds":3.003342568,"duration_seconds":1.5,"duty_cycle":0.9958327592195352,"seed":1,"threads":18,"cpu_weight":100}
+{"kind":"trial_summary","arm":"native","seed":1,"session":"A","order_index":2,"samples":159812,"p50_ns":6096,"p95_ns":7648,"p99_ns":52495,"max_ns":19007492,"background_cpu_usec":7361948,"control_actions":0,"weight_switches":0,"phase_p99_ns":{"burst":2784604,"idle":10160,"spike":5025261,"steady":1069250}}

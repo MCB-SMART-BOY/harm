@@ -1,0 +1,14 @@
+{"arm":"reactive","bg_threads":18,"control_tick_ms":50,"cores":"2-3","kind":"trial_meta","order_index":1,"phase_durations_secs":[0.8,1.2,1.0,1.5],"seed":1,"session":"A"}
+{"kind":"phase","phase":"idle","monotonic_seconds":1.92e-7,"duration_seconds":0.8,"duty_cycle":0.020000000004693597,"seed":1,"threads":18,"cpu_weight":100}
+{"cpu_weight":1000,"kind":"weight","monotonic_seconds":0.00048873}
+{"kind":"phase","phase":"burst","monotonic_seconds":0.800093643,"duration_seconds":1.2,"duty_cycle":0.715625968927453,"seed":1,"threads":18,"cpu_weight":1000}
+{"cpu_weight":20,"kind":"weight","monotonic_seconds":1.346608719}
+{"cpu_weight":1000,"kind":"weight","monotonic_seconds":1.402330143}
+{"cpu_weight":20,"kind":"weight","monotonic_seconds":1.645322641}
+{"cpu_weight":1000,"kind":"weight","monotonic_seconds":1.6962371680000001}
+{"cpu_weight":20,"kind":"weight","monotonic_seconds":1.91446465}
+{"cpu_weight":1000,"kind":"weight","monotonic_seconds":1.964423525}
+{"kind":"phase","phase":"steady","monotonic_seconds":2.003781948,"duration_seconds":1.0,"duty_cycle":0.5317803177585639,"seed":1,"threads":18,"cpu_weight":1000}
+{"kind":"phase","phase":"spike","monotonic_seconds":3.007372612,"duration_seconds":1.5,"duty_cycle":0.9958327592195352,"seed":1,"threads":18,"cpu_weight":1000}
+{"cpu_weight":20,"kind":"weight","monotonic_seconds":3.236244433}
+{"kind":"trial_summary","arm":"reactive","seed":1,"session":"A","order_index":1,"samples":157930,"p50_ns":6112,"p95_ns":7344,"p99_ns":11087,"max_ns":232987063,"background_cpu_usec":7389011,"control_actions":17,"weight_switches":17,"phase_p99_ns":{"burst":16719,"idle":10271,"spike":1439917,"steady":11728}}
