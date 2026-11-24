@@ -56,6 +56,7 @@ pub(super) struct WorkerReport {
     pub seed_state: u64,
     pub completed_ns: Option<u64>,
     pub quota_checksum: Option<u64>,
+    pub updates_by_gate_end: u64,
     pub final_checksum: u64,
     pub observed_end_ns: u64,
 }
@@ -66,6 +67,7 @@ fn burn(gate: Gate, seed: u64, index: usize, quota: Option<u64>) -> WorkerReport
     let mut remaining = quota;
     let mut quota_checksum = None;
     let mut completed_ns = None;
+    let mut updates_by_gate_end = 0;
     let checksum = AtomicU64::new(seed_state);
     let published = black_box(&checksum);
     sleep_until(gate.at);
@@ -77,6 +79,9 @@ fn burn(gate: Gate, seed: u64, index: usize, quota: Option<u64>) -> WorkerReport
         }
         published.store(state, Ordering::Relaxed);
         observed_end_ns = now();
+        if observed_end_ns <= gate.end {
+            updates_by_gate_end += count;
+        }
         if let Some(left) = remaining.as_mut() {
             *left -= count;
             if *left == 0 {
@@ -93,6 +98,7 @@ fn burn(gate: Gate, seed: u64, index: usize, quota: Option<u64>) -> WorkerReport
         seed_state,
         completed_ns,
         quota_checksum,
+        updates_by_gate_end,
         final_checksum: checksum.into_inner(),
         observed_end_ns,
     }

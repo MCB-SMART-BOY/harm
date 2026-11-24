@@ -399,6 +399,7 @@ impl<I: CgroupIo> WeightController<I> {
         options: ApplyOptions,
     ) -> Result<ApplyResult, ControlError> {
         self.apply_inner(action, options, ApplyMode::Production)
+            .map(|apply| apply.weights)
     }
 
     fn apply_inner(
@@ -406,7 +407,7 @@ impl<I: CgroupIo> WeightController<I> {
         action: &ControlAction,
         options: ApplyOptions,
         mode: ApplyMode,
-    ) -> Result<ApplyResult, ControlError> {
+    ) -> Result<VerifiedApply, ControlError> {
         let apply_started_seconds = crate::monotonic_seconds();
         let path = &action.cgroup;
         fs::OpenOptions::new()
@@ -500,11 +501,14 @@ impl<I: CgroupIo> WeightController<I> {
                 .with_source(action.source),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
-            return Ok(ApplyResult {
-                before,
-                after: before,
-                readback: before,
-                dry_run: true,
+            return Ok(VerifiedApply {
+                weights: ApplyResult {
+                    before,
+                    after: before,
+                    readback: before,
+                    dry_run: true,
+                },
+                verified_at_ns: None,
             });
         }
         if intended != before {
@@ -561,6 +565,10 @@ impl<I: CgroupIo> WeightController<I> {
                 return Err(classify_cgroup_io(&error, reason));
             }
         };
+        let verified_at_ns = matches!(mode, ApplyMode::Study { .. }).then(|| {
+            let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+        });
         let readback_completed_seconds = crate::monotonic_seconds();
         if readback != intended {
             let rollback = self
@@ -620,11 +628,14 @@ impl<I: CgroupIo> WeightController<I> {
             )));
         }
         self.last_change = Some(Instant::now());
-        Ok(ApplyResult {
-            before,
-            after: intended,
-            readback,
-            dry_run: false,
+        Ok(VerifiedApply {
+            weights: ApplyResult {
+                before,
+                after: intended,
+                readback,
+                dry_run: false,
+            },
+            verified_at_ns,
         })
     }
     pub fn restore_all(&mut self) -> Result<(), ControlError> {
@@ -685,6 +696,16 @@ impl<I: CgroupIo> StudyWeightController<I> {
         options: ApplyOptions,
         decision_started_seconds: f64,
     ) -> Result<ApplyResult, ControlError> {
+        self.apply_verified(action, options, decision_started_seconds)
+            .map(|apply| apply.weights)
+    }
+
+    pub(crate) fn apply_verified(
+        &mut self,
+        action: &ControlAction,
+        options: ApplyOptions,
+        decision_started_seconds: f64,
+    ) -> Result<VerifiedApply, ControlError> {
         self.0.apply_inner(
             action,
             options,
@@ -740,6 +761,13 @@ pub struct ApplyResult {
     pub after: u32,
     pub readback: u32,
     pub dry_run: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedApply {
+    pub(crate) weights: ApplyResult,
+    /// CLOCK_MONOTONIC at readback, before audit I/O. Populated by the study actuator.
+    pub(crate) verified_at_ns: Option<u64>,
 }
 
 #[derive(Debug)]

@@ -6,6 +6,7 @@ use crate::{
     Source,
     control::{
         ApplyOptions, AuditRecord, ControlAction, ControlError, ControlGuards, DelegatedScope,
+        VerifiedApply,
     },
 };
 use sha2::{Digest, Sha256};
@@ -196,6 +197,29 @@ pub(super) struct Effective {
     pub readback: u32,
 }
 
+impl Effective {
+    fn from_verified(
+        verified: VerifiedApply,
+        gate: u64,
+        before: u32,
+        requested: u32,
+    ) -> Option<Self> {
+        let write = verified.weights;
+        if write.dry_run
+            || write.before != before
+            || write.after != requested
+            || write.readback != requested
+        {
+            return None;
+        }
+        Some(Self {
+            elapsed_ns: verified.verified_at_ns?.checked_sub(gate)?,
+            before: write.before,
+            readback: write.readback,
+        })
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct Tick {
     kind: &'static str,
@@ -313,7 +337,7 @@ impl Controller<'_> {
                             + (expiry - checking) as f64 / SECOND as f64,
                         source,
                     };
-                    match actuator.apply(
+                    match actuator.apply_verified(
                         &action,
                         ApplyOptions {
                             dry_run: false,
@@ -322,24 +346,18 @@ impl Controller<'_> {
                         },
                         process_decision_start,
                     ) {
-                        Ok(write)
-                            if write.before == effective_weight
-                                && write.after == requested
-                                && write.readback == requested =>
-                        {
-                            let change = Effective {
-                                elapsed_ns: now() - gate,
-                                before: write.before,
-                                readback: write.readback,
-                            };
-                            result.actions.push(change);
-                            effective_weight = change.readback;
-                            applied = Some(change);
-                            outcome = "verified";
-                        }
-                        Ok(_) => {
-                            outcome = "apply_mismatch";
-                            result.apply_failed = true;
+                        Ok(write) => {
+                            if let Some(change) =
+                                Effective::from_verified(write, gate, effective_weight, requested)
+                            {
+                                result.actions.push(change);
+                                effective_weight = change.readback;
+                                applied = Some(change);
+                                outcome = "verified";
+                            } else {
+                                outcome = "apply_mismatch";
+                                result.apply_failed = true;
+                            }
                         }
                         Err(e) => {
                             outcome = "apply_rejected";
@@ -631,6 +649,49 @@ impl ControlRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_apply_uses_verified_readback_time_even_if_audit_returns_late() {
+        let cfg = StudyConfig::from_file(Path::new("configs/matrix-pilot.json")).unwrap();
+        let gate = 50 * SECOND;
+        let actuator_return_ns = gate + 200 * MS;
+        let write = VerifiedApply {
+            weights: crate::control::ApplyResult {
+                before: 100,
+                after: 1000,
+                readback: 1000,
+                dry_run: false,
+            },
+            verified_at_ns: Some(gate + 2 * MS),
+        };
+        let change = Effective::from_verified(write.clone(), gate, 100, 1000).unwrap();
+        let mut control = ControlRun {
+            actions: vec![Effective {
+                elapsed_ns: actuator_return_ns - gate,
+                ..change
+            }],
+            ..ControlRun::default()
+        };
+        assert!(!control.has_initial_apply(Arm::StaticHigh, &cfg));
+        control.actions[0] = change;
+        assert!(control.has_initial_apply(Arm::StaticHigh, &cfg));
+        for verified_at_ns in [None, Some(gate - 1)] {
+            let unproven = VerifiedApply {
+                verified_at_ns,
+                ..write.clone()
+            };
+            assert!(Effective::from_verified(unproven, gate, 100, 1000).is_none());
+        }
+        let mut mismatch = write.clone();
+        mismatch.weights.readback = 20;
+        assert!(Effective::from_verified(mismatch, gate, 100, 1000).is_none());
+        let late = VerifiedApply {
+            verified_at_ns: Some(gate + 50 * MS),
+            ..write
+        };
+        control.actions[0] = Effective::from_verified(late, gate, 100, 1000).unwrap();
+        assert!(!control.has_initial_apply(Arm::StaticHigh, &cfg));
+    }
 
     #[test]
     fn void_rules_use_changed_verified_sequence_and_lead_windows() {
