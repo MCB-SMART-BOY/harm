@@ -1,16 +1,17 @@
 // Usage: taskset -c 4 bun experiments/matrix-pilot-2.ts MODE BINARY CONFIG OUTPUT
-// Modes: calibrate, stress, pilot, stress-a3. Each mode writes to a fresh subdirectory.
+// Modes: calibrate, stress, pilot, stress-a3, stress-a4. Each mode writes to a fresh subdirectory.
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 const [mode, executable, configPath, output] = Bun.argv.slice(2);
-if (!["calibrate", "stress", "pilot", "stress-a3"].includes(mode) || !executable || !configPath || !output)
+if (!["calibrate", "stress", "pilot", "stress-a3", "stress-a4"].includes(mode) || !executable || !configPath || !output)
   throw new Error("expected MODE BINARY CONFIG OUTPUT");
 const binary = resolve(executable);
 const cfgPath = resolve(configPath);
 const cfg = await Bun.file(cfgPath).json();
-if (cfg.matrix.stage !== (mode === "stress-a3" ? "full" : "pilot"))
-  throw new Error("stress-a3 requires the scored config; other modes require the pilot config");
+const scoredStress = mode === "stress-a3" || mode === "stress-a4";
+if (cfg.matrix.stage !== (scoredStress ? "full" : "pilot"))
+  throw new Error("stress-a3 and stress-a4 require the scored config; other modes require the pilot config");
 const dir = resolve(output, mode);
 mkdirSync(dir);
 const classes = ["w1", "w2", "w3", "w4"];
@@ -57,7 +58,7 @@ function snapshot(label: string) {
     lms_ps: command("timeout", "5s", "lms", "ps"), free_g: command("free", "-g"),
     loadavg: read("/proc/loadavg"),
     psi: Object.fromEntries(["cpu", "memory", "io"].map(type => [type, read(`/proc/pressure/${type}`)])),
-    ...(mode === "stress-a3" ? { temperatures_c: Object.fromEntries(temperatures()) } : {}),
+    ...(scoredStress ? { temperatures_c: Object.fromEntries(temperatures()) } : {}),
   });
 }
 
@@ -142,7 +143,7 @@ try {
   } else if (mode === "stress") {
     for (let index = 1; index <= 20; index++)
       await smoke("w3", "static-high", 1001, `stress-${index}`, cfgPath);
-  } else if (mode === "stress-a3") {
+  } else if (scoredStress) {
     const seed = 2001;
     const exitCode = await launch(["record-traces", "--workload", "w1", "--seed", `${seed}`,
       "--config", cfgPath, "--out-dir", `${dir}/references`],

@@ -212,3 +212,38 @@ rates. A zero denominator yields `Unavailable`. Historical pilot ticks use
 `expired` for the same pre-apply refusal and can be re-audited from the
 retained tick and apply/readback records. This amendment was made before
 inspecting any scored-session outcome.
+
+**A4, 2026-11-25 (Asia/Shanghai), before the new Stage-0 stress series.**
+The controller and its observation loop remain part of the system under
+test and run in the same delegated manager cgroup. Pin their trial thread
+to CPUs 0–1 in every arm, including Native and the Oracle reference runs.
+Keep the foreground, its timing probes, both manager fillers, and all 18
+nice +10 workload threads on CPUs 2–3. Starving the controller with the
+measured load makes the void rate depend on how often each arm writes
+and biases complete-block yield. A deployment can reserve host CPU
+capacity for control instead of sharing the two workload CPUs with the
+18-thread batch.
+
+Enforce expiry using a fresh monotonic clock in the actuator and recheck
+immediately before a live write. For matrix actions use the exact
+gate-based tick expiry in `CLOCK_MONOTONIC`. Preserve the caller's clock
+sample for audit. The write and readback may still straddle expiry, in
+which case A3's stale-apply void rule applies. Keep the 50 ms tick and
+strict `[0, 50 ms)` initial window. For each tick record decision start
+minus scheduled time and summarize first, p99, max, and the number of
+starts at or beyond tick expiry. For verified applies include p99
+actuator entry-to-readback latency alongside §4's sum and max, retaining
+the underlying audit stamps.
+
+Re-audit the A2 pilot using A3 scoring and A4 timing definitions where raw
+records permit. The historical pilot cannot measure the new placement.
+For the W1 Stage-0 yield estimate, use those W1 pilot rates for Native
+and the two Static arms, and the new 20-trial, scored-parameter stress
+rates for Reactive and Oracle. The historical pilot still supplies §5
+headroom evidence. Multiply the five observed arm-valid fractions by
+27 to estimate yield. Require every arm's rate to be at most 5% voids
+and the estimate to be at least 21 of 27. If a required first apply still
+misses the initial window after A4, report the observed rate and stop
+before either scored session, even if the yield thresholds pass. Record
+the binary and environment and commit the Stage-0 verdict before
+starting a scored session.

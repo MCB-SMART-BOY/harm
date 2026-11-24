@@ -191,7 +191,8 @@ impl Launcher<'_> {
                 "void_reasons": [if fs::metadata(path).is_ok_and(|meta| meta.len() > 0) { VoidReason::Crash } else { VoidReason::DelegationUnavailable }],
                 "error": format!("systemd-run/taskset status: {status:?}"),
                 "slo_violation_rate": null, "phase_p99_ns": null, "background_completion": null,
-                "controller_overhead": null, "expiry_metrics": null, "prediction_cost_ns": null, "joint_slo_pass": null,
+                "controller_overhead": null, "controller_tick_timing": null, "expiry_metrics": null,
+                "prediction_cost_ns": null, "joint_slo_pass": null,
             })
         });
         let uid = rustix::process::getuid().as_raw();

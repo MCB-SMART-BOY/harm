@@ -225,6 +225,7 @@ pub(super) struct Tick {
     kind: &'static str,
     scheduled_ns: u64,
     decision_start_ns: u64,
+    tick_lateness_ns: u64,
     decision_end_ns: u64,
     observation: Observation,
     observation_cost_ns: u64,
@@ -334,30 +335,24 @@ impl Controller<'_> {
             if let Some((requested, source)) = proposal
                 && weight_change_proposed
             {
-                let expiry = gate + scheduled_ns + interval;
-                let checking = now();
-                let attempt = if checking >= expiry {
-                    Err(ControlError::Expired)
-                } else {
-                    let now_seconds = crate::monotonic_seconds();
-                    let action = ControlAction {
-                        workload: self.class.name().into(),
-                        cgroup: paths.clone(),
-                        cpu_weight: requested,
-                        expires_at_seconds: now_seconds
-                            + (expiry - checking) as f64 / SECOND as f64,
-                        source,
-                    };
-                    actuator.apply_verified(
-                        &action,
-                        ApplyOptions {
-                            dry_run: false,
-                            is_background: true,
-                            now_seconds,
-                        },
-                        process_decision_start,
-                    )
+                let action = ControlAction {
+                    workload: self.class.name().into(),
+                    cgroup: paths.clone(),
+                    cpu_weight: requested,
+                    // The study actuator uses the absolute gate-based deadline.
+                    expires_at_seconds: f64::INFINITY,
+                    source,
                 };
+                let attempt = actuator.apply_verified(
+                    &action,
+                    ApplyOptions {
+                        dry_run: false,
+                        is_background: true,
+                        now_seconds: process_decision_start,
+                    },
+                    process_decision_start,
+                    gate + scheduled_ns + interval,
+                );
                 (applied, outcome, error) =
                     result.record_proposal(attempt, gate, effective_weight, requested);
                 if let Some(change) = applied {
@@ -368,6 +363,7 @@ impl Controller<'_> {
                 kind: "control_tick",
                 scheduled_ns,
                 decision_start_ns: decision_start - gate,
+                tick_lateness_ns: decision_start.saturating_sub(gate + scheduled_ns),
                 decision_end_ns: decision_end - gate,
                 observation,
                 observation_cost_ns: observed - decision_start,
@@ -494,9 +490,43 @@ pub(super) struct Overhead {
     decision_to_readback_seconds: f64,
     trial_fraction: f64,
     max_apply_to_readback_seconds: f64,
+    p99_apply_to_readback_ns: u128,
+}
+
+#[derive(Serialize)]
+pub(super) struct TickTiming {
+    tick_count: usize,
+    first_lateness_ns: u64,
+    p99_lateness_ns: u128,
+    max_lateness_ns: u128,
+    ticks_at_or_after_expiry: usize,
 }
 
 impl ControlRun {
+    pub fn tick_timing(&self, phases: Phases, cfg: &StudyConfig) -> Option<TickTiming> {
+        let interval = cfg.control_tick_ms * MS;
+        if self.ticks.len() as u64 != phases.total() / interval {
+            return None;
+        }
+        let first_lateness_ns = self.ticks.first()?.tick_lateness_ns;
+        let mut samples: Vec<_> = self
+            .ticks
+            .iter()
+            .map(|tick| u128::from(tick.tick_lateness_ns))
+            .collect();
+        samples.sort_unstable();
+        Some(TickTiming {
+            tick_count: samples.len(),
+            first_lateness_ns,
+            p99_lateness_ns: crate::percentile(&samples, 0.99),
+            max_lateness_ns: *samples.last()?,
+            ticks_at_or_after_expiry: samples
+                .iter()
+                .filter(|&&ns| ns >= u128::from(interval))
+                .count(),
+        })
+    }
+
     fn record_proposal(
         &mut self,
         attempt: std::result::Result<VerifiedApply, ControlError>,
@@ -592,7 +622,7 @@ impl ControlRun {
         let absent = |_| VoidReason::MissingVerifiedApply;
         let mut apply = 0.0;
         let mut readback = 0.0;
-        let mut max_readback = 0.0_f64;
+        let mut apply_latencies = Vec::new();
         let mut i = 0;
         let mut restored = false;
         let mut last_time = 0.0;
@@ -629,7 +659,7 @@ impl ControlRun {
                     apply += timing.apply_started_seconds - timing.decision_started_seconds;
                     let cost = timing.readback_completed_seconds - timing.apply_started_seconds;
                     readback += cost;
-                    max_readback = max_readback.max(cost);
+                    apply_latencies.push((cost * SECOND as f64).round() as u128);
                     i += 1;
                 }
                 "restore" => {
@@ -648,13 +678,16 @@ impl ControlRun {
         if i > 0 && !restored {
             return Err(VoidReason::FailedRestoration);
         }
-        Ok((i > 0).then_some(Overhead {
+        apply_latencies.sort_unstable();
+        Ok((i > 0).then(|| Overhead {
             verified_actions: i,
             decision_to_apply_seconds: apply,
             apply_to_readback_seconds: readback,
             decision_to_readback_seconds: apply + readback,
             trial_fraction: (apply + readback) / (total as f64 / SECOND as f64),
-            max_apply_to_readback_seconds: max_readback,
+            max_apply_to_readback_seconds: *apply_latencies.last().expect("verified apply") as f64
+                / SECOND as f64,
+            p99_apply_to_readback_ns: crate::percentile(&apply_latencies, 0.99),
         }))
     }
 
@@ -799,6 +832,7 @@ mod tests {
                 kind: "control_tick",
                 scheduled_ns: t * MS,
                 decision_start_ns: decision_ms * MS,
+                tick_lateness_ns: (decision_ms - t) * MS,
                 decision_end_ns: decision_ms * MS,
                 observation: observe(
                     MatrixClass::W1,
