@@ -86,6 +86,14 @@ enum Command {
         #[arg(long)]
         oracle_trace: Option<PathBuf>,
     },
+    #[command(name = "__matrix-trial", hide = true)]
+    InternalMatrixTrial(study::MatrixTrial),
+    #[command(name = "__matrix-cpu", hide = true)]
+    InternalMatrixCpu {
+        seed: u64,
+        count: usize,
+        quota: u64,
+    },
     #[command(name = "__control", hide = true)]
     InternalControl {
         #[arg(long)]
@@ -151,6 +159,10 @@ enum StudyCommand {
         config: PathBuf,
         #[arg(long, default_value = "experiments/data/traces")]
         out_dir: PathBuf,
+        #[arg(long, requires = "seed")]
+        workload: Option<study::MatrixClass>,
+        #[arg(long, requires = "workload")]
+        seed: Option<u64>,
     },
     Run {
         #[arg(long, default_value = "configs/oracle-study.json")]
@@ -161,6 +173,8 @@ enum StudyCommand {
         trials_dir: PathBuf,
         #[arg(long, default_value = "experiments/data/traces")]
         oracle_trace_dir: PathBuf,
+        #[command(flatten)]
+        matrix: study::MatrixRun,
     },
     Analyze {
         #[arg(long)]
@@ -327,21 +341,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config.display()
                 );
             }
-            StudyCommand::RecordTraces { config, out_dir } => {
-                let cfg = study::StudyConfig::from_legacy_run_file(&config)
-                    .map_err(std::io::Error::other)?;
-                study::record_traces(&cfg, &config, &out_dir).map_err(std::io::Error::other)?
+            StudyCommand::RecordTraces {
+                config,
+                out_dir,
+                workload,
+                seed,
+            } => {
+                let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                match (cfg.schema_version, workload.zip(seed)) {
+                    (2, Some((class, seed))) => {
+                        study::record_matrix_reference(&cfg, &config, &out_dir, class, seed)?
+                    }
+                    (1, None) => study::record_traces(&cfg, &config, &out_dir)
+                        .map_err(std::io::Error::other)?,
+                    (2, None) => {
+                        return Err(std::io::Error::other(
+                            "matrix reference requires --workload and --seed",
+                        )
+                        .into());
+                    }
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "--workload and --seed require a matrix config",
+                        )
+                        .into());
+                    }
+                }
             }
             StudyCommand::Run {
                 config,
                 session,
                 trials_dir,
                 oracle_trace_dir,
+                matrix,
             } => {
-                let cfg = study::StudyConfig::from_legacy_run_file(&config)
-                    .map_err(std::io::Error::other)?;
-                study::run_session(&cfg, &config, &session, &trials_dir, &oracle_trace_dir)
-                    .map_err(std::io::Error::other)?
+                let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                if cfg.schema_version == 2 {
+                    study::run_matrix(
+                        &cfg,
+                        &config,
+                        &session,
+                        &trials_dir,
+                        &oracle_trace_dir,
+                        &matrix,
+                    )?;
+                } else {
+                    if matrix.smoke
+                        || matrix.llm_state.is_some()
+                        || !matrix.llm_pid.is_empty()
+                        || matrix.matrix_pilot_report.is_some()
+                    {
+                        return Err(std::io::Error::other(
+                            "matrix options require schema version 2",
+                        )
+                        .into());
+                    }
+                    study::run_session(&cfg, &config, &session, &trials_dir, &oracle_trace_dir)
+                        .map_err(std::io::Error::other)?;
+                }
             }
             StudyCommand::Analyze { dir } => {
                 let results = study::analyze(&dir, None).map_err(std::io::Error::other)?;
@@ -378,6 +435,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             oracle_trace.as_deref(),
         )
         .map_err(std::io::Error::other)?,
+        Command::InternalMatrixTrial(trial) => study::run_matrix_in_scope(&trial)?,
+        Command::InternalMatrixCpu { seed, count, quota } => {
+            study::run_fixed_worker(seed, count, quota)?
+        }
         Command::InternalControl {
             unit,
             weight,
