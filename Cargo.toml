@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/gpu-probe"]
+members = [".", "crates/gpu-probe", "crates/predict-cost"]
 resolver = "3"
 
 [package]
