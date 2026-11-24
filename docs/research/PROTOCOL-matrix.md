@@ -124,3 +124,62 @@ The other research questions about model and device selection, expiry and cross-
 ## 9. Amendments
 
 **A1, 2026-11-24, before the pilot.** Define the exact W4 loss to make the CPU check reproducible. After the SGD update use `sum((XW−Y)²)/(2 × 512)`, with the sum over all elements. This is the squared error whose gradient is specified in §2. For the bootstrap use the explicitly specified `ceil(p × (n−1))` index regardless of percentile naming.
+
+**A2, 2026-11-25, before the replacement pilot.** The competing CPU job models
+a compile step whose artifact is required by the end of the same 12 s session.
+The job counts as finished when all 18 workers reach the fixed per-thread
+quota. Size the quota from independently measured burn throughput within that
+12 s budget. [The first pilot](PILOT-matrix.md) and its unapplied proposal are
+retained as historical records.
+
+The calibration ran two fresh 12 s trials per class and fixed weight (20 and
+100), using the exact class foreground duty, CPUs 2–3, 18 nice +10 job threads
+and two nice +19 manager fillers. The installed `qwen3.8-flash-next@iq4_xs`
+model was resident and idle. Each worker counted the kernel updates in blocks
+observed complete by gate end, including padding. The calibration used the
+registered seeds `1001` and `1002` in separate feasibility runs before
+replacement-pilot data collection. No CPU job completion time entered the
+sizing calculation. The throughput of the slowest thread in each replicate
+sets the largest identical quota all 18 threads could finish. The observed
+rates below are in millions of updates per second. Each pair shows seed 1001
+then seed 1002.
+
+| Class | Weight 20, slowest worker | Weight 100, slowest worker | Weight 20, all workers | Weight 100, all workers |
+|---|---:|---:|---:|---:|
+| W1 | 47.900843 / 44.973227 | 90.395819 / 73.326763 | 1317.624491 / 1361.586517 | 1725.276843 / 1660.285952 |
+| W2 | 65.719744 / 91.064085 | 80.777664 / 65.355541 | 1435.343744 / 1665.863552 | 1806.212651 / 1787.947221 |
+| W3 | 90.202624 / 81.799339 | 90.126165 / 71.903061 | 1803.321344 / 1722.548907 | 1838.663339 / 1849.877845 |
+| W4 | 70.286848 / 95.177557 | 91.933184 / 59.739307 | 1799.140693 / 1779.563179 | 1829.080064 / 1779.299307 |
+
+Let `L` be the larger of the two weight-20 slowest-worker update counts and
+`N` the smaller of the two weight-100 counts at 12 s. Require a quota at least
+`1.30 × L` and at most `N`, then round the lower bound up to the next 10
+million updates. The 30% margin is relative to weight 20's measured
+capacity. A quota strictly below `N` leaves additional Native headroom.
+These bounds apply to the two observed replicates at each weight. The
+replacement pilot tests whether the separation holds in practice.
+
+| Class | `L` updates | `N` updates | Rounded quota needed | Fits Native bound |
+|---|---:|---:|---:|---|
+| W1 | 574,810,112 | 879,921,152 | 750,000,000 | Yes |
+| W2 | 1,092,769,024 | 784,266,496 | 1,430,000,000 | No |
+| W3 | 1,082,431,488 | 862,836,736 | 1,410,000,000 | No |
+| W4 | 1,142,130,688 | 716,871,680 | 1,490,000,000 | No |
+
+For W1, 750,000,000 updates per worker is 30.48% above the measured weight-20
+capacity and leaves 129,921,152 updates of spare capacity at the conservative
+Native bound. This **supersedes W1's 160,000,000-update quota and 11 s
+deadline** in §2 with 750,000,000 updates per worker and a 12 s deadline
+in both registered configs.
+
+The favorable weight-20 replicate in each of W2–W4 outperformed the least
+favorable Native replicate on the last-worker endpoint. Even without a
+30% margin, those bounds give no separating quota at the session deadline.
+The release phases give their CPU job more runway even while the always-low
+arm protects the foreground. W2 keeps its registered 9.5 s deadline and W3/W4
+keep 11 s for the replacement pilot and §5 validity check. The first pilot's
+unapplied 3.0 s and 2.5 s proposal is superseded by this calibration.
+If a class still fails the CPU headroom check, hold it from the full stage.
+Recommend moving CPU completion and censoring to secondary outcomes in a
+future amendment for W2–W4, with a fresh foreground validity pilot before
+scoring.

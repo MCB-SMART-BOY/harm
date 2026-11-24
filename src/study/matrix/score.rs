@@ -332,6 +332,7 @@ mod tests {
             seed_state: 1,
             completed_ns: Some(11 * SECOND),
             quota_checksum: Some(1),
+            updates_by_gate_end: 0,
             final_checksum: 2,
             observed_end_ns: 13 * SECOND,
         }];
