@@ -13,7 +13,9 @@ mod runner;
 
 pub use analyze::{PairComparison, analyze, collect_p99};
 pub use config::StudyConfig;
-pub use metrics::{PairComparisonStats, paired_bootstrap};
+pub use metrics::{
+    BackgroundCompletion, ControllerOverhead, PairComparisonStats, paired_bootstrap,
+};
 pub use runner::{
     TrialSummary, launch_trial, record_traces, run_actuator_power, run_controlled_trial,
     run_session, run_trial_in_scope,

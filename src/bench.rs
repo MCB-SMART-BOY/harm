@@ -127,10 +127,15 @@ fn burn_plan(phases: &[(Duration, f64)]) {
     }
 }
 pub fn burn_blocked_child(plan: &str, threads: usize) -> Result<(), String> {
+    burn_blocked_child_timed(plan, threads).map(|_| ())
+}
+
+pub fn burn_blocked_child_timed(plan: &str, threads: usize) -> Result<Duration, String> {
     let mut gate = [0u8; 1];
     std::io::stdin()
         .read_exact(&mut gate)
         .map_err(|e| e.to_string())?;
+    let start = Instant::now();
     let phases = parse_plan(plan)?;
     let workers: Vec<_> = (0..threads.max(1))
         .map(|_| {
@@ -141,7 +146,7 @@ pub fn burn_blocked_child(plan: &str, threads: usize) -> Result<(), String> {
     for worker in workers {
         worker.join().map_err(|_| "CPU burn thread panicked")?;
     }
-    Ok(())
+    Ok(start.elapsed())
 }
 fn spawn_burn(exe: &Path, plan: &str, threads: usize) -> Result<Child, String> {
     Command::new(exe)

@@ -322,10 +322,12 @@ mod tests {
     #[test]
     fn production_predictor_refuses_oracle_observations() {
         let mut window = window();
-        window.observations[2].source = Source::Oracle;
-        assert!(matches!(
-            predict_with_budget(&LastValuePredictor, &window, &action()),
-            Err(PredictError::InvalidTrace(_))
-        ));
+        for source in [Source::Oracle, Source::StudyOracle] {
+            window.observations[2].source = source;
+            assert!(matches!(
+                predict_with_budget(&LastValuePredictor, &window, &action()),
+                Err(PredictError::InvalidTrace(_))
+            ));
+        }
     }
 }

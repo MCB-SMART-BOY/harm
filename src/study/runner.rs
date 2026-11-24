@@ -1,21 +1,25 @@
 use super::{
     StudyConfig,
-    analyze::{analyze, print_comparisons, write_summary},
+    analyze::{actuator_authority, analyze, print_comparisons, write_summary},
+    metrics::{
+        BackgroundCompletion, ControllerOverhead, score_background, score_latency, score_overhead,
+        sum_prediction_cost_ns,
+    },
 };
 use crate::{
     JsonlWriter, Source,
     control::{
-        ApplyOptions, CgroupIo, ControlAction, ControlGuards, Controller, DelegatedScope,
+        ApplyOptions, AuditRecord, CgroupIo, ControlAction, ControlGuards, DelegatedScope,
         FileCgroupIo, FuturePhaseController, unique_unit,
     },
-    percentile, write_jsonl,
+    write_jsonl,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    fmt::Display,
     fs,
-    hint::black_box,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -76,14 +80,26 @@ pub struct TrialSummary {
     pub session: String,
     pub order_index: usize,
     pub samples: usize,
-    pub p50_ns: u128,
-    pub p95_ns: u128,
-    pub p99_ns: u128,
-    pub max_ns: u128,
-    pub background_cpu_usec: i64,
+    pub p50_ns: Option<u128>,
+    pub p95_ns: Option<u128>,
+    pub p99_ns: Option<u128>,
+    pub max_ns: Option<u128>,
+    #[serde(default, deserialize_with = "deserialize_cpu_usage")]
+    pub background_cpu_usec: Option<i64>,
     pub control_actions: usize,
     pub weight_switches: usize,
-    pub phase_p99_ns: std::collections::BTreeMap<String, u128>,
+    pub phase_p99_ns: BTreeMap<String, Option<u128>>,
+    pub slo_violation_rate: Option<f64>,
+    pub background_completion: Option<BackgroundCompletion>,
+    pub controller_overhead: Option<ControllerOverhead>,
+    pub prediction_cost_ns: Option<u128>,
+}
+
+fn deserialize_cpu_usage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    // Old summaries used -1 as the missing CPU usage sentinel.
+    Ok(Option::<i64>::deserialize(deserializer)?.filter(|&usage| usage >= 0))
 }
 
 fn read_usage_usec(cgroup: &Path) -> Option<i64> {
@@ -96,10 +112,31 @@ fn read_usage_usec(cgroup: &Path) -> Option<i64> {
     None
 }
 
-fn spawn_burn(exe: &Path, plan: &str, threads: usize) -> Result<Child, String> {
+fn read_controller_overhead(path: &Path, expected_actions: usize) -> Option<ControllerOverhead> {
+    let reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut timings = Vec::new();
+    for line in reader.lines() {
+        let row: AuditRecord = serde_json::from_str(&line.ok()?).ok()?;
+        if row.event == "apply" && row.result == "applied" {
+            timings.push(row.action_timing);
+        }
+    }
+    if timings.len() != expected_actions {
+        return None;
+    }
+    score_overhead(timings)
+}
+
+fn spawn_burn(
+    exe: &Path,
+    plan: &str,
+    threads: usize,
+    report_completion: bool,
+) -> Result<Child, String> {
     // Nice the CPU-bound background load generator so it yields to the owner's interactive work;
     // identical for every arm, so comparisons stay fair. The foreground probe is not niced.
-    Command::new("nice")
+    let mut command = Command::new("nice");
+    command
         .args(["-n", "10"])
         .arg(exe)
         .arg("__burn")
@@ -108,10 +145,13 @@ fn spawn_burn(exe: &Path, plan: &str, threads: usize) -> Result<Child, String> {
         .arg("--threads")
         .arg(threads.to_string())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| e.to_string())
+        .stderr(Stdio::inherit());
+    if report_completion {
+        command.arg("--report-completion").stdout(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null());
+    }
+    command.spawn().map_err(|e| e.to_string())
 }
 
 /// Run one controlled trial inside an already-delegated scope. Returns the per-trial summary.
@@ -136,7 +176,9 @@ pub fn run_controlled_trial(
         trace,
         &serde_json::json!({ "kind": "trial_meta", "arm": arm_name, "seed": seed, "session": session,
             "order_index": order_index, "cores": cfg.cores, "bg_threads": cfg.bg_threads,
-            "phase_durations_secs": cfg.phase_durations_secs, "control_tick_ms": cfg.control_tick_ms }),
+            "phase_durations_secs": cfg.phase_durations_secs, "control_tick_ms": cfg.control_tick_ms,
+            "slo_latency_threshold_ns": cfg.slo_latency_threshold_ns,
+            "background_deadline_secs": cfg.background_deadline_secs }),
     )
     .map_err(|e| e.to_string())?;
 
@@ -149,6 +191,9 @@ pub fn run_controlled_trial(
         max_frequency: Duration::from_millis(20),
     };
     let mut controller = scope.study_weight_controller(guards, audit_path.clone());
+    let mut last_applied = FileCgroupIo
+        .read_weight(scope.workload())
+        .map_err(|e| format!("read initial cpu.weight: {e}"))?;
 
     let plan = config
         .durations
@@ -161,6 +206,7 @@ pub fn run_controlled_trial(
         &std::env::current_exe().map_err(|e| e.to_string())?,
         &plan,
         config.threads,
+        cfg.background_deadline_secs.is_some(),
     )?;
     if let Err(e) = scope.attach_pid(worker.id()) {
         let _ = worker.kill();
@@ -185,13 +231,11 @@ pub fn run_controlled_trial(
         .write_all(b"g")
         .map_err(|e| e.to_string())?;
 
-    let mut policy = ArmPolicy::from_name(arm_name, cfg, oracle_trace)?;
-    // Seed the applied weight so arms that want a non-default value act on the first tick.
-    let mut last_applied: Option<u32> =
-        Some(FileCgroupIo.read_weight(scope.workload()).unwrap_or(100));
+    let policy = ArmPolicy::from_name(arm_name, cfg, oracle_trace)?;
 
     let mut latency: Vec<u128> = Vec::new();
-    let mut phase_lat: std::collections::BTreeMap<String, Vec<u128>> = Default::default();
+    let mut phase_lat = BTreeMap::<String, Vec<u128>>::new();
+    let mut predictor_timings = Vec::new();
     let mut recent: VecDeque<(f64, u128)> = VecDeque::new(); // (mono_s, ns) within reactive window
     let mut control_actions = 0usize;
     let mut weight_switches = 0usize;
@@ -201,6 +245,7 @@ pub fn run_controlled_trial(
     let tick = Duration::from_millis(cfg.control_tick_ms.max(1));
 
     for (idx, phase) in config.names.iter().enumerate() {
+        let phase_samples = phase_lat.entry((*phase).to_owned()).or_default();
         writer
             .write(&crate::bench::PhaseRecord {
                 kind: "phase".into(),
@@ -210,7 +255,7 @@ pub fn run_controlled_trial(
                 duty_cycle: config.duties[idx],
                 seed,
                 threads: config.threads,
-                cpu_weight: last_applied.unwrap_or(100),
+                cpu_weight: last_applied,
             })
             .map_err(|e| e.to_string())?;
         let phase_end = Instant::now() + config.durations[idx];
@@ -223,7 +268,7 @@ pub fn run_controlled_trial(
             ping.read_exact(&mut ack).map_err(|e| e.to_string())?;
             let ns = start.elapsed().as_nanos();
             latency.push(ns);
-            phase_lat.entry((*phase).to_string()).or_default().push(ns);
+            phase_samples.push(ns);
             recent.push_back((crate::monotonic_seconds(), ns));
 
             // Control tick at the shared cadence. Native observes but never acts.
@@ -241,7 +286,7 @@ pub fn run_controlled_trial(
                     expires_at_seconds: f64::INFINITY,
                     source,
                 };
-                let desired = match &mut policy {
+                let desired = match &policy {
                     ArmPolicy::Native => None,
                     ArmPolicy::Static { weight } => {
                         Some(action_for_weight(*weight, Source::Assumed))
@@ -266,21 +311,23 @@ pub fn run_controlled_trial(
                         }
                     }
                     ArmPolicy::Oracle(ctl) => {
-                        ctl.decide(
+                        let (action, inference_cost) = ctl.decide_timed(
                             &crate::control::ControlObservation {
                                 workload: "study".into(),
                                 psi_cpu_some_avg10: None, // deliberately no live state for the oracle
-                                current_weight: last_applied.unwrap_or(100),
+                                current_weight: last_applied,
                                 monotonic_seconds: crate::monotonic_seconds(),
                                 source: Source::Observed,
                             },
                             scope.workload(),
-                        )
+                        );
+                        predictor_timings.push(inference_cost);
+                        Some(action)
                     }
                 };
 
                 if let Some(action) = desired
-                    && last_applied != Some(action.cpu_weight)
+                    && last_applied != action.cpu_weight
                 {
                     match controller.apply(
                         &action,
@@ -294,7 +341,7 @@ pub fn run_controlled_trial(
                         Ok(res) => {
                             control_actions += 1;
                             weight_switches += 1;
-                            last_applied = Some(res.after);
+                            last_applied = res.after;
                             writer
                                     .write(&serde_json::json!({"kind":"weight","monotonic_seconds":crate::monotonic_seconds(),"cpu_weight":res.after}))
                                     .map_err(|e| e.to_string())?;
@@ -317,22 +364,15 @@ pub fn run_controlled_trial(
     controller
         .restore_all()
         .map_err(|e| format!("restore: {e:?}"))?;
-    let status = worker.wait().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("CPU workload exited {status}"));
+    let output = worker.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!("CPU workload exited {}", output.status));
     }
 
-    latency.sort_unstable();
-    let mut phase_p99 = std::collections::BTreeMap::new();
-    for (name, xs) in &phase_lat {
-        let mut v = xs.clone();
-        v.sort_unstable();
-        phase_p99.insert(name.clone(), percentile(&v, 0.99));
-    }
-    let background_cpu_usec = match (usage_before, usage_after) {
-        (Some(b), Some(a)) => a - b,
-        _ => -1, // Unavailable is not zero; analyze treats negative as missing.
-    };
+    let background_elapsed_ns = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|stdout| stdout.trim().parse().ok());
+    let scores = score_latency(&mut latency, &mut phase_lat, cfg.slo_latency_threshold_ns);
     let summary = TrialSummary {
         kind: "trial_summary".into(),
         arm: arm_name.into(),
@@ -340,19 +380,32 @@ pub fn run_controlled_trial(
         session: session.into(),
         order_index,
         samples: latency.len(),
-        p50_ns: percentile(&latency, 0.50),
-        p95_ns: percentile(&latency, 0.95),
-        p99_ns: percentile(&latency, 0.99),
-        max_ns: *latency.last().unwrap_or(&0),
-        background_cpu_usec,
+        p50_ns: scores.p50_ns,
+        p95_ns: scores.p95_ns,
+        p99_ns: scores.p99_ns,
+        max_ns: scores.max_ns,
+        background_cpu_usec: usage_after
+            .zip(usage_before)
+            .and_then(|(a, b)| a.checked_sub(b))
+            .filter(|&usage| usage >= 0),
         control_actions,
         weight_switches,
-        phase_p99_ns: phase_p99,
+        phase_p99_ns: scores.phase_p99_ns,
+        slo_violation_rate: scores.slo_violation_rate,
+        background_completion: score_background(
+            background_elapsed_ns,
+            cfg.background_deadline_secs,
+        ),
+        controller_overhead: read_controller_overhead(&audit_path, control_actions),
+        prediction_cost_ns: sum_prediction_cost_ns(&predictor_timings),
     };
     writer.write(&summary).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
-    black_box(usage_before); // keep the before-sample in scope for clarity
     Ok(summary)
+}
+
+fn display_metric(value: Option<impl Display>) -> String {
+    value.map_or_else(|| "Unavailable".into(), |value| value.to_string())
 }
 
 /// Launch one trial inside a fresh delegated scope pinned to `cores` via taskset. Parent-side.
@@ -479,11 +532,11 @@ pub fn run_trial_in_scope(
         summary.seed,
         summary.session,
         summary.samples,
-        summary.p50_ns,
-        summary.p95_ns,
-        summary.p99_ns,
-        summary.max_ns,
-        summary.background_cpu_usec,
+        display_metric(summary.p50_ns),
+        display_metric(summary.p95_ns),
+        display_metric(summary.p99_ns),
+        display_metric(summary.max_ns),
+        display_metric(summary.background_cpu_usec),
         summary.weight_switches
     );
     Ok(())
@@ -570,8 +623,8 @@ pub fn run_actuator_power(
     const SEED: u64 = 5; // fixed workload for the calibration (identical across weights/reps)
     let reps = 5usize;
     let weights = [100u32, 400, 10_000];
-    let mut rows: Vec<(u32, usize, u128, u128, u128)> = Vec::new(); // weight, rep, pooled, spike, burst p99 ns
-    for &w in &weights {
+    let mut spike_by_weight: [Vec<u128>; 3] = Default::default();
+    for (w, spike_samples) in weights.into_iter().zip(&mut spike_by_weight) {
         let mut c = cfg.clone();
         c.static_weight = w;
         c.arms = vec!["static".into()];
@@ -587,62 +640,56 @@ pub fn run_actuator_power(
             launch_trial(
                 &exe, &c, &cfg_w, "static", SEED, "actuator", rep, &trace, out_dir,
             )?;
-            let mut pooled = 0u128;
-            let mut spike = 0u128;
-            let mut burst = 0u128;
-            for line in fs::read_to_string(&trace)
+            let summary = fs::read_to_string(&trace)
                 .map_err(|e| e.to_string())?
                 .lines()
-            {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-                    && v["kind"] == "trial_summary"
-                {
-                    pooled = v["p99_ns"].as_u64().unwrap_or(0) as u128;
-                    spike = v["phase_p99_ns"]["spike"].as_u64().unwrap_or(0) as u128;
-                    burst = v["phase_p99_ns"]["burst"].as_u64().unwrap_or(0) as u128;
-                }
+                .filter_map(|line| serde_json::from_str::<TrialSummary>(line).ok())
+                .find(|summary| summary.kind == "trial_summary");
+            let phase_p99 =
+                |phase: &str| summary.as_ref()?.phase_p99_ns.get(phase).copied().flatten();
+            let pooled = summary.as_ref().and_then(|summary| summary.p99_ns);
+            let spike = phase_p99("spike");
+            if let Some(spike) = spike {
+                spike_samples.push(spike);
             }
-            rows.push((w, rep, pooled, spike, burst));
+            let us = |ns: Option<u128>| display_metric(ns.map(|ns| ns / 1000));
             println!(
                 "actuator weight={w:>5} rep={rep} pooled_p99_us={:<9} spike_p99_us={:<9} burst_p99_us={}",
-                pooled / 1000,
-                spike / 1000,
-                burst / 1000
+                us(pooled),
+                us(spike),
+                us(phase_p99("burst"))
             );
         }
     }
-    // H1: mean spike-phase p99 must span >=2x across the weight range and be non-decreasing in weight.
-    let mean_spike = |w: u32| -> f64 {
-        let v: Vec<f64> = rows
-            .iter()
-            .filter(|r| r.0 == w)
-            .map(|r| r.3 as f64)
-            .collect();
-        if v.is_empty() {
-            0.0
-        } else {
-            v.iter().sum::<f64>() / v.len() as f64
-        }
-    };
-    let (s100, s400, s10k) = (mean_spike(100), mean_spike(400), mean_spike(10_000));
-    let monotone = s100 <= s400 * 1.2 && s400 <= s10k * 1.2; // allow small noise band
-    let span = if s100 > 0.0 {
-        s10k / s100
-    } else {
-        f64::INFINITY
-    };
-    println!(
-        "actuator H1: mean spike p99 us w100={:.0} w400={:.0} w10000={:.0} span_x={:.2} monotone={} -> authority={}",
-        s100 / 1000.0,
-        s400 / 1000.0,
-        s10k / 1000.0,
-        span,
-        monotone,
-        if span >= 2.0 && monotone {
-            "YES"
-        } else {
-            "NO (RQ2 negative; oracle moot)"
-        }
-    );
+    actuator_authority(&spike_by_weight, reps);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_summary_loads_and_missing_metrics_serialize_as_null() {
+        let sample = include_str!("../../experiments/data/samples/study-native-sample.jsonl");
+        let line = sample.lines().last().unwrap();
+        let summary: TrialSummary = serde_json::from_str(line).unwrap();
+        assert_eq!(summary.p99_ns, Some(52_495));
+        assert_eq!(summary.phase_p99_ns["spike"], Some(5_025_261));
+
+        let mut legacy: serde_json::Value = serde_json::from_str(line).unwrap();
+        legacy["background_cpu_usec"] = (-1).into();
+        let summary: TrialSummary = serde_json::from_str(&legacy.to_string()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+        for field in [
+            "background_cpu_usec",
+            "slo_violation_rate",
+            "background_completion",
+            "controller_overhead",
+            "prediction_cost_ns",
+        ] {
+            assert!(json.get(field).is_some_and(serde_json::Value::is_null));
+        }
+    }
 }
