@@ -1,5 +1,5 @@
 use super::{
-    control::{Arm, Controller, Oracle, Reference, action_voids, weights},
+    control::{Arm, Controller, Oracle, Reference, weights},
     score::{completion, score, stream_voids},
     workload::{CpuChild, Fillers, Foreground, Gate, verify_nice, worker_seed},
     *,
@@ -8,7 +8,7 @@ use crate::{
     JsonlWriter, Source,
     control::{CgroupIo, DelegatedScope, FileCgroupIo},
 };
-use rustix::thread::sched_getaffinity;
+use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::SystemTime};
 
@@ -40,16 +40,29 @@ pub struct MatrixTrial {
     pub llm_pid: Vec<u32>,
 }
 
-fn affinity() -> Result<()> {
+const WORKLOAD_CPUS: [usize; 2] = [2, 3];
+const CONTROL_CPUS: [usize; 2] = [0, 1];
+
+fn require_affinity(expected: [usize; 2]) -> Result<()> {
     let cpus = sched_getaffinity(None)
         .map_err(|e| MatrixError::new(VoidReason::AffinityUnavailable, e))?;
-    if cpus.count() != 2 || !cpus.is_set(2) || !cpus.is_set(3) {
+    if cpus.count() != expected.len() as u32 || !expected.into_iter().all(|cpu| cpus.is_set(cpu)) {
         return Err(MatrixError::new(
             VoidReason::AffinityUnavailable,
-            "process must inherit exactly CPUs 2-3",
+            format!("current thread must be pinned to exactly CPUs {expected:?}"),
         ));
     }
     Ok(())
+}
+
+fn pin_controller() -> Result<()> {
+    let mut cpus = CpuSet::new();
+    for cpu in CONTROL_CPUS {
+        cpus.set(cpu);
+    }
+    sched_setaffinity(None, &cpus)
+        .map_err(|e| MatrixError::new(VoidReason::AffinityUnavailable, e))?;
+    require_affinity(CONTROL_CPUS)
 }
 
 pub fn run_matrix_in_scope(input: &MatrixTrial) -> Result<()> {
@@ -67,7 +80,7 @@ pub fn run_matrix_in_scope(input: &MatrixTrial) -> Result<()> {
         {
             return Err(config_error("seed not in the registered plan"));
         }
-        affinity()?;
+        require_affinity(WORKLOAD_CPUS)?;
         verify_nice(0)?;
         let scope = DelegatedScope::discover_and_delegate(&input.unit)
             .map_err(|e| MatrixError::new(VoidReason::DelegationUnavailable, format!("{e:?}")))?;
@@ -112,7 +125,8 @@ pub fn run_matrix_in_scope(input: &MatrixTrial) -> Result<()> {
             "workload": input.workload, "arm": input.arm, "seed": input.seed, "session": input.session,
             "order_index": input.order_index, "void_reasons": [e.reason], "error": e.detail,
             "slo_violation_rate": null, "phase_p99_ns": null, "background_completion": null,
-            "controller_overhead": null, "prediction_cost_ns": null, "joint_slo_pass": null,
+            "controller_overhead": null, "controller_tick_timing": null, "expiry_metrics": null,
+            "prediction_cost_ns": null, "joint_slo_pass": null,
         }))?;
         file.flush()?;
     }
@@ -193,12 +207,16 @@ fn execute(
     let mut manager = Fillers::manager(matrix.manager_fill_threads, input.seed)?;
     let before = host_snapshot(&input.llm_pid);
     let mut foreground = Foreground::prepare(workload, matrix, phases, input.seed)?;
+    // All foreground workers, manager fillers, and the CPU child inherit 2–3.
+    // Only the trial thread moves. It runs both controller ticks and observation.
+    pin_controller()?;
     let usage_before = cgroup_usage(scope);
     file.write(&json!({
         "kind": "matrix_trial_meta", "schema_version": 2, "workload": workload, "seed": input.seed,
         "session": input.session, "arm": arm, "order_index": input.order_index, "purpose": purpose(input),
         "source": Source::Observed, "started_unix_seconds": wall_time(),
-        "cores": cfg.cores, "scope": scope.root, "manager_cgroup": scope.manager,
+        "cores": cfg.cores, "controller_observer_cores": CONTROL_CPUS,
+        "scope": scope.root, "manager_cgroup": scope.manager,
         "workload_cgroup": scope.workload(), "verified_workload_pid": cpu.pid(), "initial_leaf_weight": INITIAL_WEIGHT,
         "config": cfg, "cpu_updates_per_thread": quota, "adapter": foreground.adapter,
         "oracle_trace_sha256": oracle.as_ref().map(|r| &r.hash), "before_warmup": before,
@@ -220,25 +238,10 @@ fn execute(
     let cpu_result = cpu.finish();
     let manager_result = manager.join();
     let control = control_result?;
-    let (overhead, mut voids) = control.metrics(&audit, phases.total(), cfg.control_tick_ms * MS);
-    if !control.has_initial_apply(arm, cfg)
-        || FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT)
-    {
-        voids.push(if !control.has_initial_apply(arm, cfg) {
-            VoidReason::MissingVerifiedApply
-        } else {
-            VoidReason::FailedRestoration
-        });
+    let (overhead, mut voids) = control.validate(&audit, arm, phases, cfg);
+    if FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT) {
+        voids.push(VoidReason::FailedRestoration);
     }
-    // Compare again with the matched observed Static-low sequence in the session
-    // manifest. This catches constant fallback even in a standalone trial.
-    voids.extend(action_voids(
-        arm,
-        phases,
-        cfg,
-        &control.actions,
-        &[cfg.static_weight],
-    ));
     let events = foreground.events.lock().expect("finished foreground");
     let stream_reasons = stream_voids(workload, phases, matrix, &events);
     let events_available = foreground_result.is_ok()
@@ -334,6 +337,8 @@ fn execute(
             "seed": input.seed, "arm": arm, "session": input.session, "order_index": input.order_index,
             "source": Source::Observed, "ended_unix_seconds": wall_time(), "after_drain": after,
             "background_completion": job, "threshold_passes": thresholds, "controller_overhead": overhead,
+            "controller_tick_timing": control.tick_timing(phases, cfg),
+            "expiry_metrics": control.expiry_metrics(phases, cfg),
             "prediction_and_observation_cost": control.costs(),
             "prediction_cost_ns": control.costs()["prediction_cost_ns"],
             "effective_weight_sequence": weights(&control.actions), "control_actions": control.actions.len(),

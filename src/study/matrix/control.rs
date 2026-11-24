@@ -225,16 +225,28 @@ pub(super) struct Tick {
     kind: &'static str,
     scheduled_ns: u64,
     decision_start_ns: u64,
+    tick_lateness_ns: u64,
     decision_end_ns: u64,
     observation: Observation,
     observation_cost_ns: u64,
     proposed_weight: Option<u32>,
     proposed_source: Option<Source>,
+    weight_change_proposed: bool,
     effective_weight: u32,
     applied: Option<Effective>,
     outcome: &'static str,
     error: Option<String>,
     forecast_ns: Option<u64>,
+}
+
+const EXPIRED_PROPOSAL: &str = "expired_proposal";
+
+#[derive(Serialize)]
+pub(super) struct ExpiryMetrics {
+    expired_proposal_count: usize,
+    weight_change_proposal_count: usize,
+    forecasts_with_expired_proposal_count: usize,
+    forecast_count: usize,
 }
 
 #[derive(Default)]
@@ -319,65 +331,45 @@ impl Controller<'_> {
             let mut applied = None;
             let mut outcome = "no_change";
             let mut error = None;
+            let weight_change_proposed = proposal.is_some_and(|p| p.0 != effective_weight);
             if let Some((requested, source)) = proposal
-                && requested != effective_weight
+                && weight_change_proposed
             {
-                let expiry = gate + scheduled_ns + interval;
-                let checking = now();
-                if checking >= expiry {
-                    outcome = "expired";
-                    result.apply_failed = true;
-                } else {
-                    let now_seconds = crate::monotonic_seconds();
-                    let action = ControlAction {
-                        workload: self.class.name().into(),
-                        cgroup: paths.clone(),
-                        cpu_weight: requested,
-                        expires_at_seconds: now_seconds
-                            + (expiry - checking) as f64 / SECOND as f64,
-                        source,
-                    };
-                    match actuator.apply_verified(
-                        &action,
-                        ApplyOptions {
-                            dry_run: false,
-                            is_background: true,
-                            now_seconds,
-                        },
-                        process_decision_start,
-                    ) {
-                        Ok(write) => {
-                            if let Some(change) =
-                                Effective::from_verified(write, gate, effective_weight, requested)
-                            {
-                                result.actions.push(change);
-                                effective_weight = change.readback;
-                                applied = Some(change);
-                                outcome = "verified";
-                            } else {
-                                outcome = "apply_mismatch";
-                                result.apply_failed = true;
-                            }
-                        }
-                        Err(e) => {
-                            outcome = "apply_rejected";
-                            error = Some(format!("{e:?}"));
-                            if !matches!(e, ControlError::RateLimited) {
-                                result.apply_failed = true;
-                            }
-                        }
-                    }
+                let action = ControlAction {
+                    workload: self.class.name().into(),
+                    cgroup: paths.clone(),
+                    cpu_weight: requested,
+                    // The study actuator uses the absolute gate-based deadline.
+                    expires_at_seconds: f64::INFINITY,
+                    source,
+                };
+                let attempt = actuator.apply_verified(
+                    &action,
+                    ApplyOptions {
+                        dry_run: false,
+                        is_background: true,
+                        now_seconds: process_decision_start,
+                    },
+                    process_decision_start,
+                    gate + scheduled_ns + interval,
+                );
+                (applied, outcome, error) =
+                    result.record_proposal(attempt, gate, effective_weight, requested);
+                if let Some(change) = applied {
+                    effective_weight = change.readback;
                 }
             }
             result.ticks.push(Tick {
                 kind: "control_tick",
                 scheduled_ns,
                 decision_start_ns: decision_start - gate,
+                tick_lateness_ns: decision_start.saturating_sub(gate + scheduled_ns),
                 decision_end_ns: decision_end - gate,
                 observation,
                 observation_cost_ns: observed - decision_start,
                 proposed_weight: proposal.map(|p| p.0),
                 proposed_source: proposal.map(|p| p.1),
+                weight_change_proposed,
                 effective_weight,
                 applied,
                 outcome,
@@ -498,9 +490,89 @@ pub(super) struct Overhead {
     decision_to_readback_seconds: f64,
     trial_fraction: f64,
     max_apply_to_readback_seconds: f64,
+    p99_apply_to_readback_ns: u128,
+}
+
+#[derive(Serialize)]
+pub(super) struct TickTiming {
+    tick_count: usize,
+    first_lateness_ns: u64,
+    p99_lateness_ns: u128,
+    max_lateness_ns: u128,
+    ticks_at_or_after_expiry: usize,
 }
 
 impl ControlRun {
+    pub fn tick_timing(&self, phases: Phases, cfg: &StudyConfig) -> Option<TickTiming> {
+        let interval = cfg.control_tick_ms * MS;
+        if self.ticks.len() as u64 != phases.total() / interval {
+            return None;
+        }
+        let first_lateness_ns = self.ticks.first()?.tick_lateness_ns;
+        let mut samples: Vec<_> = self
+            .ticks
+            .iter()
+            .map(|tick| u128::from(tick.tick_lateness_ns))
+            .collect();
+        samples.sort_unstable();
+        Some(TickTiming {
+            tick_count: samples.len(),
+            first_lateness_ns,
+            p99_lateness_ns: crate::percentile(&samples, 0.99),
+            max_lateness_ns: *samples.last()?,
+            ticks_at_or_after_expiry: samples
+                .iter()
+                .filter(|&&ns| ns >= u128::from(interval))
+                .count(),
+        })
+    }
+
+    fn record_proposal(
+        &mut self,
+        attempt: std::result::Result<VerifiedApply, ControlError>,
+        gate: u64,
+        before: u32,
+        requested: u32,
+    ) -> (Option<Effective>, &'static str, Option<String>) {
+        match attempt {
+            Ok(write) => {
+                if let Some(change) = Effective::from_verified(write, gate, before, requested) {
+                    self.actions.push(change);
+                    (Some(change), "verified", None)
+                } else {
+                    self.apply_failed = true;
+                    (None, "apply_mismatch", None)
+                }
+            }
+            Err(ControlError::Expired) => (None, EXPIRED_PROPOSAL, None),
+            Err(error) => {
+                self.apply_failed |= !matches!(error, ControlError::RateLimited);
+                (None, "apply_rejected", Some(format!("{error:?}")))
+            }
+        }
+    }
+
+    pub fn validate(
+        &self,
+        audit: &Path,
+        arm: Arm,
+        phases: Phases,
+        cfg: &StudyConfig,
+    ) -> (Option<Overhead>, Vec<VoidReason>) {
+        let (overhead, mut reasons) = self.metrics(audit, phases.total(), cfg.control_tick_ms * MS);
+        if !self.has_initial_apply(arm, cfg) {
+            reasons.push(VoidReason::MissingVerifiedApply);
+        }
+        reasons.extend(action_voids(
+            arm,
+            phases,
+            cfg,
+            &self.actions,
+            &[cfg.static_weight],
+        ));
+        (overhead, reasons)
+    }
+
     pub fn metrics(
         &self,
         audit: &Path,
@@ -523,18 +595,22 @@ impl ControlRun {
         if nonmonotonic {
             reasons.push(VoidReason::NonMonotonicTiming);
         }
+        if self.ticks.iter().any(|tick| {
+            tick.applied
+                .is_some_and(|change| change.elapsed_ns >= tick.scheduled_ns + interval)
+        }) {
+            reasons.push(VoidReason::StaleAppliedDecision);
+        }
+        if self.apply_failed {
+            reasons.push(VoidReason::MissingVerifiedApply);
+        }
         let evidence = self.audit_metrics(audit, total);
         match evidence {
             Err(reason) => {
                 reasons.push(reason);
                 (None, reasons)
             }
-            Ok(overhead) => {
-                if self.apply_failed {
-                    reasons.push(VoidReason::MissingVerifiedApply);
-                }
-                (overhead, reasons)
-            }
+            Ok(overhead) => (overhead, reasons),
         }
     }
 
@@ -546,7 +622,7 @@ impl ControlRun {
         let absent = |_| VoidReason::MissingVerifiedApply;
         let mut apply = 0.0;
         let mut readback = 0.0;
-        let mut max_readback = 0.0_f64;
+        let mut apply_latencies = Vec::new();
         let mut i = 0;
         let mut restored = false;
         let mut last_time = 0.0;
@@ -583,7 +659,7 @@ impl ControlRun {
                     apply += timing.apply_started_seconds - timing.decision_started_seconds;
                     let cost = timing.readback_completed_seconds - timing.apply_started_seconds;
                     readback += cost;
-                    max_readback = max_readback.max(cost);
+                    apply_latencies.push((cost * SECOND as f64).round() as u128);
                     i += 1;
                 }
                 "restore" => {
@@ -602,13 +678,16 @@ impl ControlRun {
         if i > 0 && !restored {
             return Err(VoidReason::FailedRestoration);
         }
-        Ok((i > 0).then_some(Overhead {
+        apply_latencies.sort_unstable();
+        Ok((i > 0).then(|| Overhead {
             verified_actions: i,
             decision_to_apply_seconds: apply,
             apply_to_readback_seconds: readback,
             decision_to_readback_seconds: apply + readback,
             trial_fraction: (apply + readback) / (total as f64 / SECOND as f64),
-            max_apply_to_readback_seconds: max_readback,
+            max_apply_to_readback_seconds: *apply_latencies.last().expect("verified apply") as f64
+                / SECOND as f64,
+            p99_apply_to_readback_ns: crate::percentile(&apply_latencies, 0.99),
         }))
     }
 
@@ -634,6 +713,27 @@ impl ControlRun {
         })
     }
 
+    pub fn expiry_metrics(&self, phases: Phases, cfg: &StudyConfig) -> Option<ExpiryMetrics> {
+        if self.ticks.len() as u64 != phases.total() / (cfg.control_tick_ms * MS) {
+            return None;
+        }
+        let mut counts = ExpiryMetrics {
+            expired_proposal_count: 0,
+            weight_change_proposal_count: 0,
+            forecasts_with_expired_proposal_count: 0,
+            forecast_count: 0,
+        };
+        for tick in &self.ticks {
+            let expired = tick.outcome == EXPIRED_PROPOSAL;
+            let forecast = tick.forecast_ns.is_some();
+            counts.expired_proposal_count += usize::from(expired);
+            counts.weight_change_proposal_count += usize::from(tick.weight_change_proposed);
+            counts.forecasts_with_expired_proposal_count += usize::from(expired && forecast);
+            counts.forecast_count += usize::from(forecast);
+        }
+        Some(counts)
+    }
+
     pub fn has_initial_apply(&self, arm: Arm, cfg: &StudyConfig) -> bool {
         let expected = match arm {
             Arm::Native => return self.actions.is_empty(),
@@ -649,6 +749,157 @@ impl ControlRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_expiry_counts_without_satisfying_any_effective_sequence_requirements() {
+        let (cfg, phases, control, audit) = oracle_control_fixture(1, 6001);
+        let (overhead, reasons) = control.validate(&audit, Arm::Oracle, phases, &cfg);
+        assert!(reasons.is_empty());
+        assert_eq!(overhead.unwrap().verified_actions, 4);
+        assert_eq!(weights(&control.actions), [1000, 20, 1000, 20]);
+        assert_eq!(control.ticks[70].outcome, EXPIRED_PROPOSAL);
+        assert_eq!(control.ticks[70].effective_weight, 1000);
+        assert!(control.ticks[70].applied.is_none());
+        let counts = control.expiry_metrics(phases, &cfg).unwrap();
+        assert_eq!(counts.expired_proposal_count, 1);
+        assert_eq!(counts.weight_change_proposal_count, 5);
+        assert_eq!(counts.forecasts_with_expired_proposal_count, 1);
+        assert_eq!(counts.forecast_count, 240);
+        let mut missing_burst_apply = control.actions;
+        missing_burst_apply.remove(1);
+        assert!(
+            action_voids(Arm::Oracle, phases, &cfg, &missing_burst_apply, &[20])
+                .contains(&VoidReason::MissingOracleTransition)
+        );
+        fs::remove_file(audit).unwrap();
+    }
+
+    #[test]
+    fn applied_stale_decision_voids_even_with_a_valid_sequence() {
+        // At the expiry boundary, the steady release is still inside steady and
+        // satisfies the sequence check, but the verified write is stale.
+        let (cfg, phases, control, audit) = oracle_control_fixture(1, 6050);
+        assert_eq!(
+            control.validate(&audit, Arm::Oracle, phases, &cfg).1,
+            [VoidReason::StaleAppliedDecision]
+        );
+        fs::remove_file(audit).unwrap();
+    }
+
+    #[test]
+    fn fresh_first_apply_still_voids_if_it_misses_the_initial_window() {
+        // First verified apply from a fresh tick, but later than the initial window.
+        let (cfg, phases, control, audit) = oracle_control_fixture(51, 6001);
+        assert_eq!(
+            control.validate(&audit, Arm::Oracle, phases, &cfg).1,
+            [VoidReason::MissingVerifiedApply]
+        );
+        fs::remove_file(audit).unwrap();
+    }
+
+    fn oracle_control_fixture(
+        first_ms: u64,
+        steady_ms: u64,
+    ) -> (StudyConfig, Phases, ControlRun, std::path::PathBuf) {
+        let cfg = StudyConfig::from_file(Path::new("configs/matrix-pilot.json")).unwrap();
+        let phases = Phases::new(cfg.phase_durations_secs);
+        let interval = cfg.control_tick_ms;
+        let gate = 50 * SECOND;
+        let audit = std::env::temp_dir().join(format!("{}.jsonl", crate::control::unique_unit()));
+        let mut rows = Vec::new();
+        let mut control = ControlRun {
+            restored: true,
+            ..Default::default()
+        };
+        let mut effective_weight = INITIAL_WEIGHT;
+        for t in (0..phases.total() / MS).step_by(interval as usize) {
+            let (requested, applied_ms) = match t {
+                t if t == first_ms / interval * interval => (1000, Some(first_ms)),
+                0 => (1000, None),
+                3500 => (20, None),
+                3550 => (20, Some(3551)),
+                6000 => (1000, Some(steady_ms)),
+                9500 => (20, Some(9501)),
+                _ => (effective_weight, None),
+            };
+            let weight_change_proposed = requested != effective_weight;
+            let decision_ms = if weight_change_proposed && applied_ms.is_none() {
+                t + interval
+            } else {
+                t
+            };
+            let mut tick = Tick {
+                kind: "control_tick",
+                scheduled_ns: t * MS,
+                decision_start_ns: decision_ms * MS,
+                tick_lateness_ns: (decision_ms - t) * MS,
+                decision_end_ns: decision_ms * MS,
+                observation: observe(
+                    MatrixClass::W1,
+                    matrix_config(&cfg).unwrap(),
+                    phases,
+                    t * MS,
+                    &[],
+                ),
+                observation_cost_ns: 0,
+                proposed_weight: Some(requested),
+                proposed_source: Some(Source::StudyOracle),
+                weight_change_proposed,
+                effective_weight,
+                applied: None,
+                outcome: "no_change",
+                error: None,
+                forecast_ns: Some(0),
+            };
+            if weight_change_proposed {
+                let attempt = if let Some(at) = applied_ms {
+                    let seconds = 50.0 + at as f64 / 1000.0;
+                    rows.push(serde_json::json!({
+                        "timestamp_unix_seconds": 0, "monotonic_seconds": seconds,
+                        "event":"apply", "path":"/fixture", "requested":requested,
+                        "before":effective_weight, "after":requested, "readback":requested,
+                        "result":"applied", "reason":"fixture",
+                        "action_timing":{
+                            "decision_started_seconds": 50.0 + t as f64 / 1000.0,
+                            "apply_started_seconds": 50.0 + t as f64 / 1000.0,
+                            "readback_completed_seconds": seconds
+                        },
+                    }));
+                    Ok(VerifiedApply {
+                        weights: crate::control::ApplyResult {
+                            before: effective_weight,
+                            after: requested,
+                            readback: requested,
+                            dry_run: false,
+                        },
+                        verified_at_ns: Some(gate + at * MS),
+                    })
+                } else {
+                    Err(ControlError::Expired)
+                };
+                (tick.applied, tick.outcome, tick.error) =
+                    control.record_proposal(attempt, gate, effective_weight, requested);
+                if let Some(change) = tick.applied {
+                    effective_weight = change.readback;
+                }
+                tick.effective_weight = effective_weight;
+            }
+            control.ticks.push(tick);
+        }
+        rows.push(serde_json::json!({
+            "timestamp_unix_seconds":0, "monotonic_seconds":62.0,
+            "event":"restore", "path":"/fixture", "readback":INITIAL_WEIGHT,
+            "result":"restored", "reason":"fixture"
+        }));
+        fs::write(
+            &audit,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        (cfg, phases, control, audit)
+    }
 
     #[test]
     fn initial_apply_uses_verified_readback_time_even_if_audit_returns_late() {

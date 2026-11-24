@@ -284,6 +284,7 @@ impl Default for ControlGuards {
 pub struct ApplyOptions {
     pub dry_run: bool,
     pub is_background: bool,
+    /// Caller clock sample for audit only. The actuator enforces deadlines itself.
     pub now_seconds: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -302,6 +303,8 @@ pub struct AuditRecord {
     pub source: Option<Source>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_timing: Option<ActionTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_clock_seconds: Option<f64>,
 }
 
 /// Monotonic milestones for one verified action, in the same trial's clock domain.
@@ -313,8 +316,12 @@ pub struct ActionTiming {
 }
 
 impl AuditRecord {
-    fn with_source(mut self, source: Source) -> Self {
-        self.source = Some(source);
+    fn with_action(mut self, action: &ControlAction, options: &ApplyOptions) -> Self {
+        self.source = Some(action.source);
+        self.decision_clock_seconds = options
+            .now_seconds
+            .is_finite()
+            .then_some(options.now_seconds);
         self
     }
 }
@@ -353,6 +360,7 @@ fn audit_record(
         reason: reason.into(),
         source: None,
         action_timing: None,
+        decision_clock_seconds: None,
     }
 }
 fn rollback_status(result: io::Result<u32>, before: u32) -> (Option<u32>, &'static str) {
@@ -374,7 +382,15 @@ pub struct WeightController<I: CgroupIo = FileCgroupIo> {
 
 enum ApplyMode {
     Production,
-    Study { decision_started_seconds: f64 },
+    Study {
+        decision_started_seconds: f64,
+        deadline_monotonic_ns: Option<u64>,
+    },
+}
+
+pub(crate) fn monotonic_ns() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
 }
 
 impl<I: CgroupIo> WeightController<I> {
@@ -430,7 +446,7 @@ impl<I: CgroupIo> WeightController<I> {
                     "refused",
                     reason,
                 )
-                .with_source(action.source),
+                .with_action(action, &options),
             )
             .map_err(|e| ControlError::Io(format!("audit refused action: {e}")))
         };
@@ -444,13 +460,18 @@ impl<I: CgroupIo> WeightController<I> {
             refuse("oracle provenance is offline-only")?;
             return Err(ControlError::OracleNotProductionSafe);
         }
-        if !options.now_seconds.is_finite()
-            || action.expires_at_seconds.is_nan()
-            || options.now_seconds > action.expires_at_seconds
-        {
-            refuse("action expired or clock invalid")?;
-            return Err(ControlError::Expired);
-        }
+        let check_expiry = || {
+            let expired = action.expires_at_seconds.is_nan()
+                || crate::monotonic_seconds() >= action.expires_at_seconds
+                || matches!(mode, ApplyMode::Study { deadline_monotonic_ns: Some(deadline), .. }
+                    if monotonic_ns() >= deadline);
+            if expired {
+                refuse("action expired or clock invalid")?;
+                return Err(ControlError::Expired);
+            }
+            Ok(())
+        };
+        check_expiry()?;
         let requested = match validate_cpu_weight(u64::from(action.cpu_weight)) {
             Ok(v) => v as u32,
             Err(_) => {
@@ -498,7 +519,7 @@ impl<I: CgroupIo> WeightController<I> {
                     "not_applied",
                     "dry run; no cgroup write",
                 )
-                .with_source(action.source),
+                .with_action(action, &options),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Ok(VerifiedApply {
@@ -511,8 +532,17 @@ impl<I: CgroupIo> WeightController<I> {
                 verified_at_ns: None,
             });
         }
-        if intended != before {
-            self.originals.entry(path.clone()).or_insert(before);
+        let new_original = intended != before && !self.originals.contains_key(path);
+        if new_original {
+            self.originals.insert(path.clone(), before);
+        }
+        // Preflight and the initial read can block. Check again immediately
+        // before the write. The kernel does not provide a timed weight write.
+        if let Err(error) = check_expiry() {
+            if new_original {
+                self.originals.remove(path);
+            }
+            return Err(error);
         }
         if let Err(error) = self.io.write_weight(path, intended) {
             let rollback = self
@@ -533,7 +563,7 @@ impl<I: CgroupIo> WeightController<I> {
                     status,
                     &reason,
                 )
-                .with_source(action.source),
+                .with_action(action, &options),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Err(classify_cgroup_io(&error, reason));
@@ -559,16 +589,13 @@ impl<I: CgroupIo> WeightController<I> {
                         status,
                         &reason,
                     )
-                    .with_source(action.source),
+                    .with_action(action, &options),
                 )
                 .map_err(|e| ControlError::Io(e.to_string()))?;
                 return Err(classify_cgroup_io(&error, reason));
             }
         };
-        let verified_at_ns = matches!(mode, ApplyMode::Study { .. }).then(|| {
-            let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-            t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
-        });
+        let verified_at_ns = matches!(mode, ApplyMode::Study { .. }).then(monotonic_ns);
         let readback_completed_seconds = crate::monotonic_seconds();
         if readback != intended {
             let rollback = self
@@ -589,7 +616,7 @@ impl<I: CgroupIo> WeightController<I> {
                     status,
                     &reason,
                 )
-                .with_source(action.source),
+                .with_action(action, &options),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Err(ControlError::ReadbackMismatch {
@@ -607,9 +634,10 @@ impl<I: CgroupIo> WeightController<I> {
             "applied",
             "write verified by readback",
         )
-        .with_source(action.source);
+        .with_action(action, &options);
         if let ApplyMode::Study {
             decision_started_seconds,
+            ..
         } = mode
         {
             record.action_timing = Some(ActionTiming {
@@ -696,7 +724,7 @@ impl<I: CgroupIo> StudyWeightController<I> {
         options: ApplyOptions,
         decision_started_seconds: f64,
     ) -> Result<ApplyResult, ControlError> {
-        self.apply_verified(action, options, decision_started_seconds)
+        self.apply_inner(action, options, decision_started_seconds, None)
             .map(|apply| apply.weights)
     }
 
@@ -705,12 +733,29 @@ impl<I: CgroupIo> StudyWeightController<I> {
         action: &ControlAction,
         options: ApplyOptions,
         decision_started_seconds: f64,
+        deadline_monotonic_ns: u64,
+    ) -> Result<VerifiedApply, ControlError> {
+        self.apply_inner(
+            action,
+            options,
+            decision_started_seconds,
+            Some(deadline_monotonic_ns),
+        )
+    }
+
+    fn apply_inner(
+        &mut self,
+        action: &ControlAction,
+        options: ApplyOptions,
+        decision_started_seconds: f64,
+        deadline_monotonic_ns: Option<u64>,
     ) -> Result<VerifiedApply, ControlError> {
         self.0.apply_inner(
             action,
             options,
             ApplyMode::Study {
                 decision_started_seconds,
+                deadline_monotonic_ns,
             },
         )
     }
@@ -1134,7 +1179,7 @@ mod tests {
             workload: "test".into(),
             cgroup: path.into(),
             cpu_weight: weight,
-            expires_at_seconds: 100.0,
+            expires_at_seconds: f64::INFINITY,
             source: Source::Assumed,
         }
     }
@@ -1268,18 +1313,59 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
-    fn expiry_and_oracle_provenance_are_refused() {
+    fn action_expired_after_decision_cannot_write() {
+        let dir = test_dir("apply-expired");
+        let value = Arc::new(Mutex::new(100));
+        let backend = Fake {
+            value: value.clone(),
+            mismatch: false,
+        };
+        let mut ctl = manager(backend, &dir, &dir.join("audit.jsonl"));
+        let mut proposal = action(&dir, 200);
+        proposal.expires_at_seconds = crate::monotonic_seconds();
+        let decision_seconds = proposal.expires_at_seconds - 0.001;
+        let result = ctl.apply(&proposal, options(false, decision_seconds, false));
+        let actual = *value.lock().unwrap();
+        ctl.restore_all().unwrap();
+        let audit = fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        let _ = fs::remove_dir_all(dir);
+        assert_eq!(result.unwrap_err(), ControlError::Expired);
+        assert_eq!(actual, 100);
+        let row: AuditRecord = serde_json::from_str(audit.trim()).unwrap();
+        assert_eq!(row.event, "refused");
+        assert_eq!(row.decision_clock_seconds, Some(decision_seconds));
+    }
+    #[test]
+    fn fresh_action_writes_and_verifies_with_actuator_clock() {
+        let dir = test_dir("apply-fresh");
+        let value = Arc::new(Mutex::new(100));
+        let backend = Fake {
+            value: value.clone(),
+            mismatch: false,
+        };
+        let mut ctl = manager(backend, &dir, &dir.join("audit.jsonl"));
+        let mut proposal = action(&dir, 200);
+        proposal.expires_at_seconds = crate::monotonic_seconds() + 60.0;
+        let verified = ctl
+            .apply(
+                &proposal,
+                options(false, proposal.expires_at_seconds + 1.0, false),
+            )
+            .unwrap();
+        assert_eq!((verified.before, verified.readback), (100, 200));
+        assert_eq!(*value.lock().unwrap(), 200);
+        ctl.restore_all().unwrap();
+        assert_eq!(*value.lock().unwrap(), 100);
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn oracle_provenance_is_refused() {
         let dir = test_dir("reject");
         let backend = Fake {
             value: Arc::new(Mutex::new(100)),
             mismatch: false,
         };
         let mut ctl = manager(backend, &dir, &dir.join("audit.jsonl"));
-        assert_eq!(
-            ctl.apply(&action(&dir, 200), options(false, 101.0, false))
-                .unwrap_err(),
-            ControlError::Expired
-        );
         let mut oracle = action(&dir, 200);
         oracle.source = Source::Oracle;
         assert_eq!(
@@ -1287,7 +1373,7 @@ mod tests {
             ControlError::OracleNotProductionSafe
         );
         let audit = fs::read_to_string(dir.join("audit.jsonl")).unwrap();
-        assert!(audit.contains("action expired") && audit.contains("offline-only"));
+        assert!(audit.contains("offline-only"));
         let _ = fs::remove_dir_all(dir);
     }
     #[test]

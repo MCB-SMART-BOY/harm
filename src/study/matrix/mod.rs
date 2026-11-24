@@ -10,7 +10,7 @@ pub use workload::run_fixed_worker;
 
 use super::config::{MatrixConfig, StudyConfig};
 use gpu_probe::GpuError;
-use rustix::time::{ClockId, Timespec, clock_gettime};
+use rustix::time::{ClockId, Timespec};
 use serde::{Deserialize, Serialize};
 use std::{fmt, io, time::Duration};
 
@@ -95,6 +95,7 @@ pub enum VoidReason {
     MissingOracleTransition,
     ScopeCleanup,
     NoHeadroom,
+    StaleAppliedDecision,
 }
 
 #[derive(Debug)]
@@ -157,10 +158,7 @@ fn matrix_config(cfg: &StudyConfig) -> Result<&MatrixConfig> {
 }
 
 /// CLOCK_MONOTONIC has a shared epoch across processes, including the migrated CPU job.
-fn now() -> u64 {
-    let t = clock_gettime(ClockId::Monotonic);
-    t.tv_sec as u64 * SECOND + t.tv_nsec as u64
-}
+use crate::control::monotonic_ns as now;
 
 fn sleep_until(ns: u64) {
     let request = Timespec {
