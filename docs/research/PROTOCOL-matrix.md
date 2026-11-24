@@ -247,3 +247,30 @@ misses the initial window after A4, report the observed rate and stop
 before either scored session, even if the yield thresholds pass. Record
 the binary and environment and commit the Stage-0 verdict before
 starting a scored session.
+
+**A5, 2026-11-25 (Asia/Shanghai), after the W1 scored sessions and before
+any follow-on preregistration.** H1 failed its service clause. Oracle met
+the joint latency and CPU-deadline SLOs on 28/42 blocks and missed the CPU
+deadline on 14/42 blocks. Native met the joint SLO on 1/42 blocks, so the
+preregistered requirement that Oracle meet all SLOs on at least 90% of
+blocks was unattainable by any arm under this calibration. The gate
+therefore measured a service level that the registered design could not
+deliver. This amendment records that interpretation without changing the
+H1 outcome, scored data, thresholds, or completed-session analysis.
+
+The next preregistration must establish feasibility before efficacy
+scoring. At least one arm must satisfy both the foreground tail-latency
+SLO and the background CPU-deadline SLO in the feasibility pilot. If no
+arm satisfies both, the workload remains infeasible and has no scored
+dominance result. If the precondition holds, compare arms on the paired
+foreground-tail-latency and background-deadline plane. Use a vector
+non-inferiority margin declared before data collection, with
+`δ_latency = 0.10 ms` for the protected-phase p99 and
+`δ_deadline = 5 percentage points` for the paired deadline-miss rate.
+Declare a policy favorable only when its confidence region is
+non-inferior on both axes and strictly superior on at least one axis.
+Report the continuous background completion time as a secondary outcome,
+retain right-censoring at the deadline, and keep the paired block as the
+experimental unit. The feasibility precondition, margins, bootstrap
+procedure, and dominance direction must be fixed before inspecting
+follow-on efficacy results.
