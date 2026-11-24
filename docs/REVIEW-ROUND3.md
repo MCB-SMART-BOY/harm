@@ -70,6 +70,17 @@ TEST_EXIT=0
 
 新增测试：`FutureTrace` 只加载 phase 记录、窗口外不外推、拒绝空/畸形文件；`FuturePhaseController` 提前于转换决策、psi=None 仍可决策且对实时字段不敏感；study 同 seed→同相位调度确定性、臂随机化确定性、bootstrap 对一致改进 CI 排除零 / 无差异时为零。
 
+执行器功率检查另有一个慢速集成测试 `tests/actuator_power.rs`（`#[ignore]`，默认跳过），真实驱动 `harm actuator-power` CLI：
+
+```
+$ cargo test --test actuator_power -- --ignored --nocapture   # 实跑一次
+...
+test actuator_power_cli_completes_and_writes_summaries ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.64s
+```
+
+该测试只断言命令成功并写出每权重试验摘要，不断言 H1 判定——短相位下逐次尾部 p99 噪声过大（本次冒烟甚至给出 span_x=0.42/authority=NO），权威 YES 结论来自 §2 用完整 4.5s 相位的 `configs/oracle-study.json` 全量运行。
+
 ## 4. 当前架构
 
 父进程 `harm study run` 按固定 PRNG（splitmix64，session_seed^seed）随机化每 seed 的臂序，逐试验以 `taskset -c 2-3 systemd-run --user --scope -p Delegate=yes … __study-trial` 启动；子进程内 `discover_and_delegate` → 建白名单叶子 → 以研究守卫（max_delta=10000、min_background_weight=1、频率 20ms）构造 WeightController → spawn niced burn 子进程并 attach → UnixStream ping-pong echo 线程 → 释放门后进入主循环：每 tick(50ms) 按臂策略计算目标权重，仅在变化时经 guard 写入；记录相位标记、按相位打标签的延迟样本、权重事件、`cpu.stat` usage_usec 前后差与 `trial_summary`。Oracle 仅从 `FutureTrace` 文件 + 当前单调时钟决策（前瞻或当前为高占空则保护）。分析对每臂 vs Native 及 Oracle vs Static 做配对 bootstrap（10000 重采样，固定种子 20261124），输出均值差、95% CI、中位相对改进、Cohen's d_z。
