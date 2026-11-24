@@ -1,5 +1,5 @@
 use super::{
-    control::{Arm, Controller, Oracle, Reference, action_voids, weights},
+    control::{Arm, Controller, Oracle, Reference, weights},
     score::{completion, score, stream_voids},
     workload::{CpuChild, Fillers, Foreground, Gate, verify_nice, worker_seed},
     *,
@@ -112,7 +112,7 @@ pub fn run_matrix_in_scope(input: &MatrixTrial) -> Result<()> {
             "workload": input.workload, "arm": input.arm, "seed": input.seed, "session": input.session,
             "order_index": input.order_index, "void_reasons": [e.reason], "error": e.detail,
             "slo_violation_rate": null, "phase_p99_ns": null, "background_completion": null,
-            "controller_overhead": null, "prediction_cost_ns": null, "joint_slo_pass": null,
+            "controller_overhead": null, "expiry_metrics": null, "prediction_cost_ns": null, "joint_slo_pass": null,
         }))?;
         file.flush()?;
     }
@@ -220,25 +220,10 @@ fn execute(
     let cpu_result = cpu.finish();
     let manager_result = manager.join();
     let control = control_result?;
-    let (overhead, mut voids) = control.metrics(&audit, phases.total(), cfg.control_tick_ms * MS);
-    if !control.has_initial_apply(arm, cfg)
-        || FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT)
-    {
-        voids.push(if !control.has_initial_apply(arm, cfg) {
-            VoidReason::MissingVerifiedApply
-        } else {
-            VoidReason::FailedRestoration
-        });
+    let (overhead, mut voids) = control.validate(&audit, arm, phases, cfg);
+    if FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT) {
+        voids.push(VoidReason::FailedRestoration);
     }
-    // Compare again with the matched observed Static-low sequence in the session
-    // manifest. This catches constant fallback even in a standalone trial.
-    voids.extend(action_voids(
-        arm,
-        phases,
-        cfg,
-        &control.actions,
-        &[cfg.static_weight],
-    ));
     let events = foreground.events.lock().expect("finished foreground");
     let stream_reasons = stream_voids(workload, phases, matrix, &events);
     let events_available = foreground_result.is_ok()
@@ -334,6 +319,7 @@ fn execute(
             "seed": input.seed, "arm": arm, "session": input.session, "order_index": input.order_index,
             "source": Source::Observed, "ended_unix_seconds": wall_time(), "after_drain": after,
             "background_completion": job, "threshold_passes": thresholds, "controller_overhead": overhead,
+            "expiry_metrics": control.expiry_metrics(phases, cfg),
             "prediction_and_observation_cost": control.costs(),
             "prediction_cost_ns": control.costs()["prediction_cost_ns"],
             "effective_weight_sequence": weights(&control.actions), "control_actions": control.actions.len(),

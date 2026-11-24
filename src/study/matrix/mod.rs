@@ -95,6 +95,7 @@ pub enum VoidReason {
     MissingOracleTransition,
     ScopeCleanup,
     NoHeadroom,
+    StaleAppliedDecision,
 }
 
 #[derive(Debug)]

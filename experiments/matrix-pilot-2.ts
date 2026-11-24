@@ -1,16 +1,16 @@
 // Usage: taskset -c 4 bun experiments/matrix-pilot-2.ts MODE BINARY CONFIG OUTPUT
-// Modes: calibrate, stress, pilot. Each mode writes to a fresh subdirectory.
+// Modes: calibrate, stress, pilot, stress-a3. Each mode writes to a fresh subdirectory.
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 const [mode, executable, configPath, output] = Bun.argv.slice(2);
-if (!["calibrate", "stress", "pilot"].includes(mode) || !executable || !configPath || !output)
+if (!["calibrate", "stress", "pilot", "stress-a3"].includes(mode) || !executable || !configPath || !output)
   throw new Error("expected MODE BINARY CONFIG OUTPUT");
 const binary = resolve(executable);
 const cfgPath = resolve(configPath);
 const cfg = await Bun.file(cfgPath).json();
-if (cfg.matrix.stage !== "pilot")
-  throw new Error("only the matrix pilot stage is allowed");
+if (cfg.matrix.stage !== (mode === "stress-a3" ? "full" : "pilot"))
+  throw new Error("stress-a3 requires the scored config; other modes require the pilot config");
 const dir = resolve(output, mode);
 mkdirSync(dir);
 const classes = ["w1", "w2", "w3", "w4"];
@@ -57,6 +57,7 @@ function snapshot(label: string) {
     lms_ps: command("timeout", "5s", "lms", "ps"), free_g: command("free", "-g"),
     loadavg: read("/proc/loadavg"),
     psi: Object.fromEntries(["cpu", "memory", "io"].map(type => [type, read(`/proc/pressure/${type}`)])),
+    ...(mode === "stress-a3" ? { temperatures_c: Object.fromEntries(temperatures()) } : {}),
   });
 }
 
@@ -141,6 +142,21 @@ try {
   } else if (mode === "stress") {
     for (let index = 1; index <= 20; index++)
       await smoke("w3", "static-high", 1001, `stress-${index}`, cfgPath);
+  } else if (mode === "stress-a3") {
+    const seed = 2001;
+    const exitCode = await launch(["record-traces", "--workload", "w1", "--seed", `${seed}`,
+      "--config", cfgPath, "--out-dir", `${dir}/references`],
+      { kind: "reference", class: "w1", seed });
+    if (exitCode !== 0) throw new Error(`invalid W1 ${seed} Oracle reference`);
+    for (const arm of ["reactive", "oracle"]) {
+      snapshot(`before ${arm}`);
+      for (let index = 1; index <= 20; index++)
+        await smoke("w1", arm, seed, `stress-${arm}-${index}`, cfgPath);
+      snapshot(`after ${arm}`);
+    }
+    const scopes = command("systemctl", "--user", "list-units", "harm-*.scope", "--no-legend", "--plain");
+    log("run", { remaining_scopes: scopes, kernel: command("uname", "-r") });
+    if (scopes) throw new Error(`HARM scopes remain after stress: ${scopes}`);
   } else {
     // Use class batches as in the first pilot. Preserve the randomized arm order
     // within each matched block and capture a residency record at every boundary.

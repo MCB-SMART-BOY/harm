@@ -183,3 +183,32 @@ If a class still fails the CPU headroom check, hold it from the full stage.
 Recommend moving CPU completion and censoring to secondary outcomes in a
 future amendment for W2–W4, with a fresh foreground validity pilot before
 scoring.
+
+**A3, 2026-11-25 (Asia/Shanghai), before either scored session.** The
+[A2 replacement pilot](PILOT-matrix-2.md) (`matrix-pilot-2`, seeds
+`1001..1006`) and its Stage-0 diagnostics revealed that §5's failed required
+write rule was being applied to expired proposals the guard correctly
+refused. This interpretation penalizes the safety guard for doing its job
+and biases complete-block yield against arms that re-decide more often.
+
+A3 supersedes that interpretation of §5. Score a refused, expired weight-change
+proposal as a no-op, using the observed trial outcomes. Record
+`expired_proposal` as the control tick's outcome and count it in the trial
+summary. Only distinct, verified applies enter the effective weight sequence.
+The next tick makes its own decision. A stale decision that takes effect
+still voids the trial. Use the replacement pilot's verified-readback timestamp
+to determine when the change is effective. Compare it with the tick expiry
+(scheduled tick + 50 ms, exclusive). The first required verified change
+must still meet the arm's configured initial weight within `[0, 50 ms)` from
+the gate. §5's readback, restoration, dynamic-weight, and Oracle lead-window
+requirements continue to apply.
+
+For §4 reporting, sum `expired_proposal_count` across trials by arm and
+divide by the sum of `weight_change_proposal_count` (proposals for a weight
+different from the current verified weight, including refusals). Also report
+the number of timed forecasts associated with an `expired_proposal` tick
+divided by all timed forecasts. Report counts and denominators with both
+rates. A zero denominator yields `Unavailable`. Historical pilot ticks use
+`expired` for the same pre-apply refusal and can be re-audited from the
+retained tick and apply/readback records. This amendment was made before
+inspecting any scored-session outcome.
