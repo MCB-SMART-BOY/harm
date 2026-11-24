@@ -95,50 +95,64 @@ Because session B's median relative improvement (18.5%) is below the preregister
 in both sessions**. Decision: **NO EXPLOITABLE HEADROOM under this protocol.** Per the roadmap Phase-3 rule, ML is
 **not** justified on this evidence; the question must be revised rather than the result engineered away.
 
-Two facts qualify the negative without changing it: (i) control beats no-control *directionally* in both sessions —
-every arm's mean Δ CI excludes zero, and per-phase contention p99 drops from milliseconds to ~12 µs — so the actuator
-and feedback are genuinely effective; the gate fails on the magnitude of the **pooled** median relative improvement in
-session B, where idle/steady sample volume dilutes the contention benefit. (ii) Foresight is redundant regardless:
-Oracle − Static is null in A (CI [−511,+336] includes 0) and negligible in B (+473 ns ≈ 3%), so even a metric that
-cleared 30% would not show *prediction* value.
+Two facts qualify the negative, and one is a **protocol limitation that must be stated plainly**:
+
+(i) **The gate measures constant control vs no-control, not foresight.** The audit shows every Oracle trial applied
+exactly ONE weight change — 100→20 at monotonic ≈0.0005 s — then held it through burst/steady/spike (all 20 trials:
+`weight_switches = 1`; phase records log idle at the pre-tick default 100, then 20 for every high-duty phase), the same
+single-apply sequence as Static. So "Oracle − Native" here is really "constant-low protection vs no control," which does
+beat no-control directionally in both sessions (every arm's mean Δ CI excludes zero; contention-phase p99 drops from ms to
+~12 µs). The gate fails on the magnitude of the *pooled* median relative improvement in session B, where idle/steady sample
+volume dilutes the contention benefit.
+
+(ii) **This protocol could not test foresight at all.** With `horizon = 1.0 s` longer than the only unprotected phase
+(idle, 0.8 s), and every non-idle phase in `protect_phases`, the controller sees burst inside its lookahead from t=0 and —
+because "protect always" is feasible — never releases weight. The foresight-optimal plan *is* the constant plan by
+construction, so Oracle ≡ Static regardless of how good the prediction is. **The value of foresight was therefore not
+measured; it is untested here**, not shown to be zero.
 
 ## 5. Diagnosis
 
-The negative decision attributes to specific measured numbers:
-
-- **(b) time-invariant optimum — the dominant cause, NOT (a) unpredictability.** The workload is fully predictable
-  and the Oracle reads its exact future schedule and acts ahead of every transition (verified in weight timelines),
-  yet foresight buys nothing over a constant low weight: **Oracle − Static = −84 ns [−511,+336] (A) and +473 ns ≈ 3%
-  (B)** — null/negligible across sessions. For this workload the optimal `cpu.weight` is time-invariant ("keep
-  background throttled"), so there is no timing structure to exploit; prediction has nothing to add. The large
-  Native→control gain (burst 4.44 ms → ~12 µs) comes from *having and applying* the actuator, not from knowing the future.
-- **(e) measurement noise + pooling dilution — why the gate specifically fails.** Per-trial p99 variance is high under
-  starvation, and pooled whole-run p99 mixes idle/steady samples (~10 µs for every arm) with the contention tail, so the
-  median relative improvement swings between sessions (32.7% in A, 18.5% in B) around the 30% bar even though per-phase
-  benefit is stable and enormous (spike Native 6.3–6.8 ms → ~13–22 µs). The primary metric under-represents the effect;
-  we keep it as preregistered rather than redefine it post-hoc.
-- **(c)/(d) are not the limiter.** The actuator moves p99 by 9.5× (§1); Reactive's onset lag (burst ~0.9–1.5 ms vs
-  Oracle/Static ~12 µs) shows timing matters *for a reactive policy*, but Static already matches Oracle, so neither
-  actuator coarseness nor horizon mismatch caps the achievable benefit — there is simply no better time-varying action to find.
+- **(b) protocol degeneracy — the dominant limitation.** The Oracle's applied action sequence is a single constant weight
+  (audit: one apply at ≈0.0005 s, restore at end; `weight_switches = 1` for all 20 trials), identical to Static. This is
+  **not** evidence that prediction is redundant in general — it means the protocol made foresight and a good constant policy
+  indistinguishable: (i) idle (0.8 s) < horizon (1.0 s), so no unprotected window survives lookahead, and (ii) "protect always"
+  satisfies the objective, so there was never a decision to make ahead of time. The only claim this supports is **for this
+  workload shape, constant protection is optimal and prediction has nothing to add** — not that prediction is worthless in general.
+- **(e) measurement noise + pooling dilution — why the gate specifically fails.** Pooled whole-run p99 mixes idle/steady samples
+  (~10 µs for every arm) with the contention tail, so the median relative improvement swings between sessions (32.7% A, 18.5% B)
+  around the 30% bar even though per-phase benefit is stable and enormous (spike Native 6.3–6.8 ms → ~13–22 µs). The primary metric
+  under-represents the effect; we keep it as preregistered rather than redefine it post-hoc, but note that the 30% threshold was
+  crossed in A and missed in B largely for this dilution reason.
+- **(c)/(d) are not the limiter.** The actuator moves p99 by 9.5× (§1); Reactive's onset lag (burst ~0.9–1.5 ms vs Oracle/Static
+  ~12 µs) shows timing matters *for a reactive policy*, but Static already matches Oracle, so neither coarseness nor horizon mismatch
+  caps the achievable benefit — there was simply no time-varying action for foresight to find under this protocol.
 
 ## 6. What would change the answer
 
-- A workload whose **optimal weight genuinely oscillates** — phases where background throughput is *desired* (raise
-  weight) interleaved with latency-critical phases (lower it). Here foreground demand is uniform, so "always protect"
-  is optimal and foresight is redundant. A co-located batch job with its own deadlines would create real timing value.
-- **A hard constraint on the protective action.** Static-low sacrifices background CPU time (session B: Native ~7.28 M
-  vs Oracle/Static ~6.2–6.3 M usage_usec). If background completion were a hard SLO, "always low" would be infeasible and
-  foresight (protect only when needed) could win — the tradeoff axis this study measured but did not gate on.
-- **A primary metric that isolates contention phases** (e.g. burst+spike p99) rather than pooled whole-run p99, which
-  dilutes a real per-phase effect below the threshold; switching now would be post-hoc, so it is flagged for a *future*
-  preregistration, not this decision.
+A Phase-4 protocol that makes **Oracle ≠ Static by construction**, so foresight is actually exercised:
+
+1. **Force releases.** Include a background job with a completion deadline/SLO that "protect always" violates, so the controller
+   must choose *when* to protect vs release — a constant policy becomes infeasible and only correct timing satisfies both objectives.
+2. **Unprotected window ≥ 3× horizon.** Make an idle/low-contention stretch at least 3× the control horizon (e.g. idle ≥ 3 s with
+   horizon ≤ 1 s) so a weight release actually appears in the audit action sequence.
+3. **Joint objective.** Score foreground p99 *subject to* a background-completion constraint, instead of pooled foreground p99 alone —
+   otherwise "protect always" trivially wins and timing is never rewarded.
+4. **Acceptance check that arms differ.** Before scoring, assert the Oracle's audit action sequence actually differs from Static's
+   (number of applies > 1 *and* different timings); if they match, the trial is void by construction rather than counted as a null.
+
+Secondary: a primary metric isolating contention phases (burst+spike p99) would avoid the dilution that straddled the threshold —
+flagged for future preregistration, not this decision.
 
 ## 7. Bottom line
 
-Under the preregistered protocol and primary metric, **perfect foresight buys no exploitable end-to-end latency benefit
-over a well-chosen constant weight** on this host: the Oracle-vs-Native gate fails in session B (18.5% < 30%), and
-Oracle ≈ Static in both sessions because the optimal actuation is time-invariant. Control itself clearly helps (CI excludes
-zero in both sessions; contention-phase p99 drops hundreds of ×), but that gain needs no prediction. **Do not write ML on
-this evidence**; revise toward a workload with a time-varying optimum or a hard background-throughput constraint before
-re-testing the value of foresight.
+**The study is protocol-limited; the prediction-value question is untested.** Under the preregistered metric and threshold the
+Oracle-vs-Native gate fails in session B (18.5% < 30%), but because the Oracle degenerated to a single constant weight identical to
+Static, this measures *constant-low control vs no-control* — not foresight. What is established: `cpu.weight` has strong authority (§1)
+and constant protection beats no-control directionally in both sessions (CI excludes zero; contention-phase p99 drops hundreds of ×).
+What is NOT established: whether perfect foresight adds anything over a good constant policy — the protocol could not distinguish them.
+**Do not write ML for this workload class on this evidence, and do not claim prediction is redundant**; re-test with the Phase-4 design
+in §6 (forced releases, idle ≥ 3× horizon, joint objective, action-sequence-differs acceptance check) before drawing any conclusion about
+the value of foresight.
+
 

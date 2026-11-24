@@ -88,8 +88,8 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ## 5. RQ 状态
 
 - **RQ2（执行器是否有权威）：YES。** `cpu.weight` 单调地把前台 spike p99 从 3.2ms(100)→9.6ms(400)→31.0ms(10000)，跨度 9.54×。
-- **Phase 3 门（Oracle vs Native，预注册阈值）：未通过 →「本协议下无可利用余量」。** A session Oracle 中位相对改进 32.7%≥30% 且 CI 排除零（通过），但 B session 仅 18.5%<30%（不通过）；门要求两 session 均满足，故整体失败。
-- **RQ1/RQ5（预测是否值得）：本证据不支持。** Oracle−Static 在 A 为 −84ns[−511,336]（含零）、B 为 +473ns≈3% —— 跨 session 可忽略；对前台延迟而言，完美未来知识相对一个良好常数权重**没有可测增益**。控制本身确实有效（各臂 vs Native 的均值差 CI 在两 session 均排除零；竞争相位 p99 从毫秒级降到约 12µs），但该收益不需要预测。
+- **Phase 3 门（Oracle vs Native，预注册阈值）：未通过 →「本协议下无可利用余量」。** A session Oracle 中位相对改进 32.7%≥30% 且 CI 排除零（通过），但 B session 仅 18.5%<30%（不通过）；门要求两 session 均满足，故整体失败。注意：因下文所述退化，该门实际测的是「恒定低权重控制 vs 无控制」，并非前瞻价值。
+- **RQ1/RQ5（预测是否值得）：本协议无法检验——未测，非证否。** 审计显示每个 Oracle 试验只写一次常量权重（≈0.0005s 处 100→20，全部 20 个试验 `weight_switches=1`），与 Static 完全相同。原因：horizon(1.0s) > 唯一未保护相位 idle(0.8s)，且所有非 idle 相位都在 protect_phases、加上「protect-on-current」，使控制器从 t=0 起就持续保护、从不释放——前瞻最优计划按构造即等于常量计划。因此 Oracle−Static≈0（A −84ns[−511,336]、B +473ns≈3%）是协议产物，**不能据此断言预测冗余**。本数据只支持一条结论：**对该工作负载形状，恒定保护已最优、预测无额外可加**；完美前瞻相对良好常量策略是否真有增益，本轮未测量。控制本身有效（各臂 vs Native 均值差 CI 两 session 均排除零；竞争相位 p99 从毫秒级降到约 12µs），但该收益不需要预测。
 - **RQ3/RQ4：未触及。** 无能量测量（本机无 RAPL/powercap，本轮不做任何能耗声明）；无 NPU/加速器。
 
 ## 6. 关键路径
@@ -98,6 +98,8 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ## 7. 已知缺陷与风险
 
+- **【最严重】horizon ≥ idle 长度使 Oracle 退化为常量**：horizon(1.0s) > idle(0.8s)、所有非 idle 相位受保护、且 protect-on-current，导致每个 Oracle 试验只写一次权重（`weight_switches=1`），动作序列与 Static 完全一致。前瞻从未被执行 → **预测价值本轮未被测量**（不是被证否）。这是本轮结论的根本限制；任何「预测冗余」的表述都不成立。
+- **【严重】runner 缺少「各臂动作序列必须不同」的断言**：study runner 不校验 Oracle 与 Static 的 apply 次数/时序是否真的不同，故这种退化未被自动发现（由协调者复核审计文件才发现）。Phase-4 必须在计分前断言 Oracle 的 apply 次数 >1 且时序不同于 Static，否则按构造作废该试验。
 - **主指标稀释**：pooled p99 被 idle/steady 大量快样本稀释，使竞争相位的数百倍收益在整段上仅表现为约 18–36% 的中位相对改进，跨 session 抖动大（A 32.7% vs B 18.5%），恰好卡在 30% 阈值两侧。这是本轮门失败的方法学主因之一；已在 §6「什么会改变结论」标注为未来预注册方向，而非本轮改指标。
 - **尾部噪声高**：饥饿下样本稀少且方差大（actuator 检查中 burst p99 单次可在 ~16µs 到 ~148ms 间跳），单试验 p99 不稳；靠 20 seed 配对与 bootstrap 缓解，但 CI 较宽。
 - **Reactive 触发 RateLimited**：B session 两个 reactive 试验（seed 12、14）各一次权重写入被 20ms 频率守卫拒绝（反馈抖动），试验仍正常完成；按 §9 不构成排除，已如实记录。
@@ -107,12 +109,14 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ## 8. 下一阶段任务
 
-1. 依 §6 重新预注册一个**最优权重随时间振荡**的工作负载（前台延迟关键相位与后台吞吐需求相位交替），或给保护动作加硬约束（后台完成时间 SLO），使「始终压低」不再最优，从而给预测留出真实价值空间。
-2. 考虑以竞争相位（burst+spike）p99 作为主指标的新预注册，避免稀释；本轮不改。
-3. 若新预注册仍显示 Oracle≈Static，则据实收敛 RQ1：在本执行器与本机条件下预测不值得，转向其它研究问题或停止该线。
+1. 依 §6 重新预注册 Phase-4，使 **Oracle ≠ Static by construction**：(a) 后台作业带完成 deadline/SLO，「始终压低」违反之 → 控制器必须择时释放；(b) 未保护窗口 ≥ 3× horizon（如 idle ≥ 3s、horizon ≤ 1s），使权重释放确实出现在审计动作序列；(c) 联合目标：前台 p99 subject to 后台完成约束，而非仅整段 pooled p99。
+2. runner 增加计分前断言：Oracle 的 apply 次数 > 1 且时序不同于 Static，否则该试验按构造作废（不计入 null）。这是本轮缺失、导致退化未被发现的直接修复。
+3. 考虑以竞争相位（burst+spike）p99 作为主指标的新预注册，避免稀释；本轮不改。
+4. 仅当新预注册中各臂动作序列确已不同、而 Oracle 仍 ≈ Static 时，方可据实收敛 RQ1：在本执行器与本机条件下预测不值得；否则维持「未测」。
 
 ## 9. 下一阶段硬指标
 
 - 新一轮协议必须在任何计分试验前提交，且明确主指标、阈值、两 session 要求与排除规则。
-- 新工作负载须先以数据证明「最优权重确实时变」（例如 Oracle 显著优于最佳 Static：Oracle−Static 中位相对改进 ≥ 预注册阈值且 CI 排除零），否则不得进入 ML。
+- **计分前必须断言各臂动作序列实际不同**（Oracle apply 次数 >1 且时序 ≠ Static；未保护窗口 ≥3× horizon），否则该试验按构造作废——杜绝本轮 Oracle 退化为常量的情形。
+- 新工作负载须先以数据证明「最优权重确实时变」（例如在动作序列不同的前提下，Oracle−Static 中位相对改进 ≥ 预注册阈值且 CI 排除零），否则不得进入 ML。
 - 保持 fmt/clippy(-D warnings)/test 全绿；每臂样本与复现命令入库；完整 JSONL 不入库；不做任何能耗声明。
