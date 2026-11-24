@@ -141,6 +141,11 @@ enum ControlCommand {
 }
 #[derive(Subcommand)]
 enum StudyCommand {
+    /// Check a study configuration without launching any workloads.
+    ValidateConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
     RecordTraces {
         #[arg(long, default_value = "configs/oracle-study.json")]
         config: PathBuf,
@@ -314,8 +319,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
         } => launch_control(weight, &audit, workload_ms).map_err(std::io::Error::other)?,
         Command::Study { command } => match command {
-            StudyCommand::RecordTraces { config, out_dir } => {
+            StudyCommand::ValidateConfig { config } => {
                 let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                println!(
+                    "valid schema_version={} config={}",
+                    cfg.schema_version,
+                    config.display()
+                );
+            }
+            StudyCommand::RecordTraces { config, out_dir } => {
+                let cfg = study::StudyConfig::from_legacy_run_file(&config)
+                    .map_err(std::io::Error::other)?;
                 study::record_traces(&cfg, &config, &out_dir).map_err(std::io::Error::other)?
             }
             StudyCommand::Run {
@@ -324,7 +338,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 trials_dir,
                 oracle_trace_dir,
             } => {
-                let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+                let cfg = study::StudyConfig::from_legacy_run_file(&config)
+                    .map_err(std::io::Error::other)?;
                 study::run_session(&cfg, &config, &session, &trials_dir, &oracle_trace_dir)
                     .map_err(std::io::Error::other)?
             }
@@ -339,7 +354,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Command::ActuatorPower { config, out_dir } => {
-            let cfg = study::StudyConfig::from_file(&config).map_err(std::io::Error::other)?;
+            let cfg =
+                study::StudyConfig::from_legacy_run_file(&config).map_err(std::io::Error::other)?;
             study::run_actuator_power(&cfg, &config, &out_dir).map_err(std::io::Error::other)?
         }
         Command::InternalStudyTrial {

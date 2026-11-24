@@ -507,7 +507,7 @@ pub fn run_trial_in_scope(
     trace: &Path,
     oracle_trace: Option<&Path>,
 ) -> Result<(), String> {
-    let cfg = StudyConfig::from_file(cfg_path)?;
+    let cfg = StudyConfig::from_legacy_run_file(cfg_path)?;
     let scope = DelegatedScope::discover_and_delegate(unit)
         .map_err(|e| format!("delegation unavailable: {e:?}"))?;
     if let Some(parent) = trace.parent() {

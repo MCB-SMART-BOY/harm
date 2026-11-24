@@ -120,3 +120,7 @@ The other research questions about model and device selection, expiry and cross-
 ## 8. Config contract
 
 `configs/matrix-pilot.json` and `configs/matrix-full.json` use the strict `StudyConfig` loader with `schema_version: 2` and a required `matrix` object. It adds the run stage, session grouping/reserves, class-specific SLOs, fixed CPU quotas and GPU workload parameters. Version 1 uses the existing schedule and runner, including when `schema_version` is omitted. Version 2 uses the phase boundaries and controller knobs from the shared keys, with per-class measurements from `matrix.workloads`, and uses 100% fixed-work CPU duty rather than v1's seeded burn duty. The legacy top-level latency/deadline fields are unset for the matrix and the shared `static_weight` represents Static-low. The v1 trial runner refuses matrix inputs before launching trials. This slice provides validation with `harm study validate-config --config <path>`.
+
+## 9. Amendments
+
+**A1, 2026-11-24, before the pilot.** Define the exact W4 loss to make the CPU check reproducible. After the SGD update use `sum((XW−Y)²)/(2 × 512)`, with the sum over all elements. This is the squared error whose gradient is specified in §2. For the bootstrap use the explicitly specified `ceil(p × (n−1))` index regardless of percentile naming.

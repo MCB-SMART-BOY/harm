@@ -1,0 +1,73 @@
+{
+  "schema_version": 2,
+  "session_seed": 20261124,
+  "cores": "2-3",
+  "bg_threads": 18,
+  "phase_durations_secs": [4, 2, 4, 2],
+  "seeds": [
+    2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+    2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021,
+    3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010,
+    3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3020, 3021
+  ],
+  "control_tick_ms": 50,
+  "oracle_horizon_secs": 0.5,
+  "protect_phases": ["burst", "spike"],
+  "protected_weight": 20,
+  "free_weight": 1000,
+  "static_weight": 20,
+  "reactive_low_weight": 20,
+  "reactive_high_weight": 1000,
+  "reactive_latency_threshold_ns": 500000,
+  "arms": ["native", "static-low", "static-high", "reactive", "oracle"],
+  "matrix": {
+    "stage": "full",
+    "seeds_per_session": 21,
+    "reserve_seeds": [
+      [2022, 2023, 2024, 2025, 2026, 2027],
+      [3022, 3023, 3024, 3025, 3026, 3027]
+    ],
+    "deferred_arms": ["cost-aware"],
+    "manager_fill_threads": 2,
+    "cpu_job_duty_cycle": 1.0,
+    "workloads": {
+      "w1": {
+        "ping_pong_pairs": 1,
+        "probe_all_phases": true,
+        "p99_slo_ns": 2000000,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      },
+      "w2": {
+        "ping_pong_pairs": 1,
+        "probe_all_phases": false,
+        "p99_slo_ns": 2000000,
+        "cpu_job_updates_per_thread": 180000000,
+        "background_deadline_secs": 9.5
+      },
+      "w3": {
+        "host_threads": 1,
+        "matmul_mkn": [128, 128, 128],
+        "dispatches_per_batch": 32,
+        "batch_period_ms": 10,
+        "batch_deadline_ms": 10,
+        "max_violation_rate": 0.01,
+        "warmup_batches": 32,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      },
+      "w4": {
+        "host_threads": 1,
+        "batch_size": 512,
+        "inputs": 512,
+        "outputs": 512,
+        "matmuls_per_step": 3,
+        "learning_rate": 0.001,
+        "min_steps_per_sec": 80,
+        "warmup_steps": 32,
+        "cpu_job_updates_per_thread": 160000000,
+        "background_deadline_secs": 11
+      }
+    }
+  }
+}
