@@ -163,7 +163,11 @@ fn read_usage_usec(cgroup: &Path) -> Option<i64> {
 }
 
 fn spawn_burn(exe: &Path, plan: &str, threads: usize) -> Result<Child, String> {
-    Command::new(exe)
+    // Nice the CPU-bound background load generator so it yields to the owner's interactive work;
+    // identical for every arm, so comparisons stay fair. The foreground probe is not niced.
+    Command::new("nice")
+        .args(["-n", "10"])
+        .arg(exe)
         .arg("__burn")
         .arg("--phase-plan")
         .arg(plan)
@@ -460,8 +464,6 @@ pub fn launch_trial(
             "-q",
             "-p",
             "Delegate=yes",
-            "-p",
-            "Nice=10",
             "--unit",
             &unit,
             "--",
@@ -661,39 +663,49 @@ pub struct PairComparisonStats {
     pub n_pairs: usize,
 }
 
-/// Analyze a study directory: emit per-arm medians and paired Oracle/Static/Reactive vs Native.
+/// Analyze a study directory: paired bootstrap for each arm vs Native, plus the Oracle-vs-Static
+/// foresight contrast required by protocol §8 (H3). Positive mean_delta_ns means `arm` has lower p99.
 pub fn analyze(dir: &Path, session: Option<&str>) -> Result<Vec<PairComparison>, String> {
     let all = collect_p99(dir)?;
-    // Filter by session if requested is handled at collection via file naming; here we compare arms present.
-    let native = all.get("native").ok_or("no native arm data found")?;
+    // (arm, reference) pairs: the three gate/context comparisons vs native + the H3 foresight contrast.
+    let pairs = [
+        ("static", "native"),
+        ("reactive", "native"),
+        ("oracle", "native"),
+        ("oracle", "static"),
+    ];
     let mut results = Vec::new();
-    for arm in ["static", "reactive", "oracle"] {
-        if let Some(arm_map) = all.get(arm) {
-            let seeds: Vec<u64> = native
-                .keys()
-                .cloned()
-                .filter(|s| arm_map.contains_key(s))
-                .collect();
-            let ref_vals: Vec<f64> = seeds
-                .iter()
-                .map(|s| *native.get(s).unwrap() as f64)
-                .collect();
-            let arm_vals: Vec<f64> = seeds
-                .iter()
-                .map(|s| *arm_map.get(s).unwrap() as f64)
-                .collect();
-            if let Some(st) = paired_bootstrap(&ref_vals, &arm_vals, 20261124, 10_000) {
-                results.push(PairComparison {
-                    arm: arm.into(),
-                    reference: "native".into(),
-                    n_pairs: st.n_pairs,
-                    mean_delta_ns: st.mean,
-                    ci_low_ns: st.ci_low,
-                    ci_high_ns: st.ci_high,
-                    median_relative_improvement: st.median_relative_improvement,
-                    cohens_dz: st.cohens_dz,
-                });
-            }
+    for (arm, reference) in pairs {
+        let (Some(arm_map), Some(ref_map)) = (all.get(arm), all.get(reference)) else {
+            continue; // arm absent from this directory — skip rather than fabricate a comparison
+        };
+        let seeds: Vec<u64> = ref_map
+            .keys()
+            .cloned()
+            .filter(|s| arm_map.contains_key(s))
+            .collect();
+        if seeds.is_empty() {
+            continue;
+        }
+        let ref_vals: Vec<f64> = seeds
+            .iter()
+            .map(|s| *ref_map.get(s).unwrap() as f64)
+            .collect();
+        let arm_vals: Vec<f64> = seeds
+            .iter()
+            .map(|s| *arm_map.get(s).unwrap() as f64)
+            .collect();
+        if let Some(st) = paired_bootstrap(&ref_vals, &arm_vals, 20261124, 10_000) {
+            results.push(PairComparison {
+                arm: arm.into(),
+                reference: reference.into(),
+                n_pairs: st.n_pairs,
+                mean_delta_ns: st.mean,
+                ci_low_ns: st.ci_low,
+                ci_high_ns: st.ci_high,
+                median_relative_improvement: st.median_relative_improvement,
+                cohens_dz: st.cohens_dz,
+            });
         }
     }
     let _ = session; // reserved for per-session summaries written by the runner.
