@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/gpu-probe"]
 resolver = "3"
 
 [package]
