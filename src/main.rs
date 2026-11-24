@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use harm::{
     JsonlWriter,
-    bench::{burn_blocked_child, launch_scoped_bench, phase_duration_args, run_scoped_bench},
+    bench::{burn_blocked_child_timed, launch_scoped_bench, phase_duration_args, run_scoped_bench},
     capabilities,
     control::{launch_delegated, run_control_experiment, unique_unit},
     metadata, sample_with_gpu_probe, study,
@@ -120,6 +120,8 @@ enum Command {
         phase_plan: String,
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        #[arg(long)]
+        report_completion: bool,
     },
     Report {
         #[arg(default_value = "experiments/data/collect.jsonl")]
@@ -398,7 +400,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::InternalBurn {
             phase_plan,
             threads,
-        } => burn_blocked_child(&phase_plan, threads).map_err(std::io::Error::other)?,
+            report_completion,
+        } => {
+            let elapsed =
+                burn_blocked_child_timed(&phase_plan, threads).map_err(std::io::Error::other)?;
+            if report_completion {
+                println!("{}", elapsed.as_nanos());
+            }
+        }
         Command::Report { input } => {
             let text = std::fs::read_to_string(&input)?;
             let mut lines = text.lines();

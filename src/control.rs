@@ -99,7 +99,7 @@ impl Controller for OracleController {
             target: self.target.clone(),
             observed_at_seconds: o.monotonic_seconds,
             value: o.psi_cpu_some_avg10?,
-            source: Source::Observed,
+            source: o.source,
         };
         let window = ObservationWindow {
             observations: vec![obs],
@@ -132,7 +132,7 @@ impl OracleController {
 }
 
 /// Study Oracle for the Phase 3 upper-bound experiment. Its future knowledge comes *only* from a
-/// pre-recorded [`FutureTrace`] file; its present knowledge is only `observation.monotonic_seconds`.
+/// pre-recorded [`FutureTrace`](crate::trace::FutureTrace) file; its present knowledge is only `observation.monotonic_seconds`.
 /// It never reads live PSI, load, or the current weight to infer the future — so it cannot leak runtime
 /// state into its decision. Ahead of each protected phase (a high-duty label scheduled in the trace) it
 /// lowers background weight; during unprotected phases it raises it back.
@@ -178,19 +178,32 @@ impl FuturePhaseController {
             self.free_weight
         }
     }
+
+    /// Measure the future trace lookup used to produce the decision.
+    pub(crate) fn decide_timed(
+        &self,
+        o: &ControlObservation,
+        path: &Path,
+    ) -> (ControlAction, Duration) {
+        let start = Instant::now();
+        let weight = self.desired_weight(o.monotonic_seconds);
+        let cost = start.elapsed();
+        (
+            ControlAction {
+                workload: o.workload.clone(),
+                cgroup: path.into(),
+                cpu_weight: weight,
+                expires_at_seconds: f64::INFINITY,
+                source: Source::StudyOracle,
+            },
+            cost,
+        )
+    }
 }
 
 impl Controller for FuturePhaseController {
     fn decide(&mut self, o: &ControlObservation, path: &Path) -> Option<ControlAction> {
-        // Only the present monotonic clock is read from the observation; no live metric influences it.
-        let weight = self.desired_weight(o.monotonic_seconds);
-        Some(ControlAction {
-            workload: o.workload.clone(),
-            cgroup: path.into(),
-            cpu_weight: weight,
-            expires_at_seconds: f64::INFINITY,
-            source: Source::Assumed, // study-only; provenance is not Oracle so the guard can apply it
-        })
+        Some(self.decide_timed(o, path).0)
     }
 }
 
@@ -285,6 +298,25 @@ pub struct AuditRecord {
     pub readback: Option<u32>,
     pub result: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_timing: Option<ActionTiming>,
+}
+
+/// Monotonic milestones for one verified action, in the same trial's clock domain.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ActionTiming {
+    pub decision_started_seconds: f64,
+    pub apply_started_seconds: f64,
+    pub readback_completed_seconds: f64,
+}
+
+impl AuditRecord {
+    fn with_source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
+    }
 }
 fn audit(path: &Path, record: &AuditRecord) -> io::Result<()> {
     let mut f = fs::OpenOptions::new()
@@ -319,6 +351,8 @@ fn audit_record(
         readback,
         result: result.into(),
         reason: reason.into(),
+        source: None,
+        action_timing: None,
     }
 }
 fn rollback_status(result: io::Result<u32>, before: u32) -> (Option<u32>, &'static str) {
@@ -337,6 +371,12 @@ pub struct WeightController<I: CgroupIo = FileCgroupIo> {
     pub last_change: Option<Instant>,
     originals: HashMap<PathBuf, u32>,
 }
+
+enum ApplyMode {
+    Production,
+    Study { decision_started_seconds: f64 },
+}
+
 impl<I: CgroupIo> WeightController<I> {
     pub fn new(
         io: I,
@@ -358,6 +398,16 @@ impl<I: CgroupIo> WeightController<I> {
         action: &ControlAction,
         options: ApplyOptions,
     ) -> Result<ApplyResult, ControlError> {
+        self.apply_inner(action, options, ApplyMode::Production)
+    }
+
+    fn apply_inner(
+        &mut self,
+        action: &ControlAction,
+        options: ApplyOptions,
+        mode: ApplyMode,
+    ) -> Result<ApplyResult, ControlError> {
+        let apply_started_seconds = crate::monotonic_seconds();
         let path = &action.cgroup;
         fs::OpenOptions::new()
             .create(true)
@@ -378,7 +428,8 @@ impl<I: CgroupIo> WeightController<I> {
                     None,
                     "refused",
                     reason,
-                ),
+                )
+                .with_source(action.source),
             )
             .map_err(|e| ControlError::Io(format!("audit refused action: {e}")))
         };
@@ -386,7 +437,9 @@ impl<I: CgroupIo> WeightController<I> {
             refuse("path not in HARM-created or explicitly granted whitelist")?;
             return Err(ControlError::PathNotWhitelisted(path.clone()));
         }
-        if action.source == Source::Oracle {
+        if action.source.is_oracle()
+            && !(action.source == Source::StudyOracle && matches!(mode, ApplyMode::Study { .. }))
+        {
             refuse("oracle provenance is offline-only")?;
             return Err(ControlError::OracleNotProductionSafe);
         }
@@ -443,7 +496,8 @@ impl<I: CgroupIo> WeightController<I> {
                     Some(before),
                     "not_applied",
                     "dry run; no cgroup write",
-                ),
+                )
+                .with_source(action.source),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Ok(ApplyResult {
@@ -474,7 +528,8 @@ impl<I: CgroupIo> WeightController<I> {
                     None,
                     status,
                     &reason,
-                ),
+                )
+                .with_source(action.source),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Err(classify_cgroup_io(&error, reason));
@@ -499,12 +554,14 @@ impl<I: CgroupIo> WeightController<I> {
                         None,
                         status,
                         &reason,
-                    ),
+                    )
+                    .with_source(action.source),
                 )
                 .map_err(|e| ControlError::Io(e.to_string()))?;
                 return Err(classify_cgroup_io(&error, reason));
             }
         };
+        let readback_completed_seconds = crate::monotonic_seconds();
         if readback != intended {
             let rollback = self
                 .io
@@ -523,7 +580,8 @@ impl<I: CgroupIo> WeightController<I> {
                     Some(readback),
                     status,
                     &reason,
-                ),
+                )
+                .with_source(action.source),
             )
             .map_err(|e| ControlError::Io(e.to_string()))?;
             return Err(ControlError::ReadbackMismatch {
@@ -531,19 +589,28 @@ impl<I: CgroupIo> WeightController<I> {
                 actual: readback,
             });
         }
-        if let Err(error) = audit(
-            &self.audit_path,
-            &audit_record(
-                "apply",
-                path,
-                Some(intended),
-                Some(before),
-                Some(intended),
-                Some(readback),
-                "applied",
-                "write verified by readback",
-            ),
-        ) {
+        let mut record = audit_record(
+            "apply",
+            path,
+            Some(intended),
+            Some(before),
+            Some(intended),
+            Some(readback),
+            "applied",
+            "write verified by readback",
+        )
+        .with_source(action.source);
+        if let ApplyMode::Study {
+            decision_started_seconds,
+        } = mode
+        {
+            record.action_timing = Some(ActionTiming {
+                decision_started_seconds,
+                apply_started_seconds,
+                readback_completed_seconds,
+            });
+        }
+        if let Err(error) = audit(&self.audit_path, &record) {
             let rollback = self
                 .io
                 .write_weight(path, before)
@@ -606,6 +673,32 @@ impl<I: CgroupIo> WeightController<I> {
         Ok(())
     }
 }
+
+/// Study actuation is bound to the workload leaf of a verified HARM-created transient scope.
+/// Production callers have no option to enable study provenance on a `WeightController`.
+pub(crate) struct StudyWeightController<I: CgroupIo = FileCgroupIo>(WeightController<I>);
+
+impl<I: CgroupIo> StudyWeightController<I> {
+    pub(crate) fn apply(
+        &mut self,
+        action: &ControlAction,
+        options: ApplyOptions,
+        decision_started_seconds: f64,
+    ) -> Result<ApplyResult, ControlError> {
+        self.0.apply_inner(
+            action,
+            options,
+            ApplyMode::Study {
+                decision_started_seconds,
+            },
+        )
+    }
+
+    pub(crate) fn restore_all(&mut self) -> Result<(), ControlError> {
+        self.0.restore_all()
+    }
+}
+
 impl<I: CgroupIo> Drop for WeightController<I> {
     fn drop(&mut self) {
         for (path, original) in &self.originals {
@@ -654,10 +747,29 @@ pub struct DelegatedScope {
     pub unit: String,
     pub root: PathBuf,
     pub manager: PathBuf,
-    pub workload: PathBuf,
+    workload: PathBuf,
     pub pid: u32,
 }
 impl DelegatedScope {
+    pub fn workload(&self) -> &Path {
+        &self.workload
+    }
+
+    pub(crate) fn study_weight_controller(
+        &self,
+        guards: ControlGuards,
+        audit_path: PathBuf,
+    ) -> StudyWeightController {
+        let mut whitelist = PathWhitelist::default();
+        whitelist.mark_created(self.workload.clone());
+        StudyWeightController(WeightController::new(
+            FileCgroupIo,
+            whitelist,
+            guards,
+            audit_path,
+        ))
+    }
+
     pub fn discover_and_delegate(unit: &str) -> Result<Self, ControlError> {
         let cgroup = fs::read_to_string("/proc/self/cgroup")
             .map_err(|e| ControlError::Unavailable(e.to_string()))?;
@@ -1278,13 +1390,101 @@ mod tests {
         };
         let a = ctl.decide(&base, &path).expect("decides with psi=None");
         assert_eq!(a.cpu_weight, 20);
-        for (psi, w) in [(Some(0.0), 1u32), (Some(99.0), 10_000u32)] {
+        assert_eq!(a.source, Source::StudyOracle);
+        for (psi, w, source) in [
+            (Some(0.0), 1, Source::Predicted),
+            (Some(99.0), 10_000, Source::Assumed),
+        ] {
             let mut o = base.clone();
             o.psi_cpu_some_avg10 = psi;
             o.current_weight = w;
-            o.source = Source::Predicted;
-            assert_eq!(ctl.decide(&o, &path).unwrap().cpu_weight, a.cpu_weight);
+            o.source = source;
+            let action = ctl.decide(&o, &path).unwrap();
+            assert_eq!(action.cpu_weight, a.cpu_weight);
+            assert_eq!(action.source, Source::StudyOracle);
         }
+        assert_eq!(
+            ctl.decide(
+                &ControlObservation {
+                    monotonic_seconds: 4.6,
+                    ..base
+                },
+                &path
+            )
+            .unwrap()
+            .source,
+            Source::StudyOracle
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_study_action_is_refused_in_production_and_audited_in_study() {
+        let dir = test_dir("future-oracle-guard");
+        let path = dir.join("workload");
+        let audit_path = dir.join("audit.jsonl");
+        let value = Arc::new(Mutex::new(100));
+        let backend = Fake {
+            value: value.clone(),
+            mismatch: false,
+        };
+        let mut production = manager(backend, &path, &audit_path);
+        let decision_started = crate::monotonic_seconds();
+        let action = study_oracle(&dir)
+            .decide(
+                &ControlObservation {
+                    workload: "study".into(),
+                    psi_cpu_some_avg10: None,
+                    current_weight: 100,
+                    monotonic_seconds: 0.5,
+                    source: Source::Observed,
+                },
+                &path,
+            )
+            .unwrap();
+        assert_eq!(
+            production
+                .apply(&action, options(false, 0.5, false))
+                .unwrap_err(),
+            ControlError::OracleNotProductionSafe
+        );
+        assert_eq!(*value.lock().unwrap(), 100);
+
+        let mut study = StudyWeightController(production);
+        let mut out_of_scope = action.clone();
+        out_of_scope.cgroup = dir.join("unrelated");
+        assert!(matches!(
+            study.apply(&out_of_scope, options(false, 0.5, false), decision_started),
+            Err(ControlError::PathNotWhitelisted(_))
+        ));
+        let mut offline = action.clone();
+        offline.source = Source::Oracle;
+        assert!(matches!(
+            study.apply(&offline, options(false, 0.5, false), decision_started),
+            Err(ControlError::OracleNotProductionSafe)
+        ));
+        assert_eq!(*value.lock().unwrap(), 100);
+        study
+            .apply(&action, options(false, 0.5, false), decision_started)
+            .unwrap();
+        assert_eq!(*value.lock().unwrap(), 20);
+        study.restore_all().unwrap();
+        assert_eq!(*value.lock().unwrap(), 100);
+
+        let rows: Vec<AuditRecord> = fs::read_to_string(audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            (&*rows[0].event, rows[0].source),
+            ("refused", Some(Source::StudyOracle))
+        );
+        let applied = rows.iter().find(|row| row.event == "apply").unwrap();
+        assert_eq!(applied.source, Some(Source::StudyOracle));
+        let timing = applied.action_timing.unwrap();
+        assert!(timing.decision_started_seconds <= timing.apply_started_seconds);
+        assert!(timing.apply_started_seconds <= timing.readback_completed_seconds);
         let _ = fs::remove_dir_all(dir);
     }
 }

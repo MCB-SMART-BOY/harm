@@ -45,6 +45,12 @@ pub enum Source {
     Predicted,
     Assumed,
     Oracle,
+    StudyOracle,
+}
+impl Source {
+    pub fn is_oracle(self) -> bool {
+        matches!(self, Self::Oracle | Self::StudyOracle)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sample {
@@ -89,7 +95,7 @@ pub struct Prediction {
 }
 impl Prediction {
     pub fn valid_at(&self, now_seconds: f64) -> bool {
-        self.source != Source::Oracle
+        !self.source.is_oracle()
             && now_seconds.is_finite()
             && now_seconds <= self.expires_at_seconds
             && now_seconds >= self.observed_at_seconds
@@ -105,7 +111,7 @@ pub fn validate_production_prediction(
     prediction: &Prediction,
     now_seconds: f64,
 ) -> Result<(), ActionError> {
-    if prediction.source == Source::Oracle {
+    if prediction.source.is_oracle() {
         return Err(ActionError::OracleNotProductionSafe);
     }
     if !prediction.valid_at(now_seconds) {
@@ -237,7 +243,7 @@ fn expired_prediction_rejected() {
 }
 #[test]
 fn oracle_predictions_cannot_enter_production() {
-    let p = Prediction {
+    let mut p = Prediction {
         target: "cpu.pressure".into(),
         predicted_value: 0.0,
         observed_at_seconds: 1.0,
@@ -249,10 +255,14 @@ fn oracle_predictions_cannot_enter_production() {
         expires_at_seconds: 2.0,
         source: Source::Oracle,
     };
-    assert_eq!(
-        validate_production_prediction(&p, 1.5),
-        Err(ActionError::OracleNotProductionSafe)
-    );
+    for source in [Source::Oracle, Source::StudyOracle] {
+        p.source = source;
+        assert_eq!(
+            validate_production_prediction(&p, 1.5),
+            Err(ActionError::OracleNotProductionSafe)
+        );
+        assert!(!p.valid_at(1.5));
+    }
 }
 #[test]
 fn weight_is_bounded() {
