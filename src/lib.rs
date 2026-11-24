@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+pub mod bench;
+pub mod control;
+pub mod predict;
+pub mod telemetry;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::Path,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -51,6 +55,7 @@ pub struct Sample {
     pub cgroup_cpu_stat: Metric<String>,
     pub collector_wall_seconds: f64,
     pub collector_cpu_seconds: Metric<Seconds>,
+    pub gpu_probe: Option<telemetry::GpuProbe>,
     pub quality: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +75,7 @@ pub struct RunMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Prediction {
     pub target: String,
+    pub predicted_value: f64,
     pub observed_at_seconds: f64,
     pub horizon_seconds: f64,
     pub uncertainty: Ratio,
@@ -114,6 +120,9 @@ pub fn validate_cpu_weight(weight: u64) -> Result<u64, ActionError> {
 }
 
 static MONOTONIC_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+pub fn monotonic_seconds() -> f64 {
+    MONOTONIC_START.elapsed().as_secs_f64()
+}
 pub fn metric_file(path: &str) -> Metric<String> {
     match fs::read_to_string(path) {
         Ok(s) => Metric::Available(s.trim().to_owned()),
@@ -157,6 +166,9 @@ fn process_cpu_seconds() -> Metric<Seconds> {
     )
 }
 pub fn sample() -> Sample {
+    sample_with_gpu_probe(false)
+}
+pub fn sample_with_gpu_probe(include_gpu_probe: bool) -> Sample {
     let start = Instant::now();
     let mono = MONOTONIC_START.elapsed().as_secs_f64();
     let cpu_before = process_cpu_seconds();
@@ -165,6 +177,7 @@ pub fn sample() -> Sample {
     let psi_memory = metric_file("/proc/pressure/memory");
     let psi_io = metric_file("/proc/pressure/io");
     let cgroup_cpu_stat = metric_file("/sys/fs/cgroup/cpu.stat");
+    let gpu_probe = include_gpu_probe.then(telemetry::probe_gpu);
     let cpu_after = process_cpu_seconds();
     let cpu_seconds = match (cpu_before, cpu_after) {
         (Metric::Available(before), Metric::Available(after)) => {
@@ -196,6 +209,7 @@ pub fn sample() -> Sample {
         cgroup_cpu_stat,
         collector_wall_seconds: start.elapsed().as_secs_f64(),
         collector_cpu_seconds: cpu_seconds,
+        gpu_probe,
         quality,
     }
 }
@@ -204,6 +218,7 @@ pub fn sample() -> Sample {
 fn expired_prediction_rejected() {
     let p = Prediction {
         target: "cpu.pressure".into(),
+        predicted_value: 0.0,
         observed_at_seconds: 1.0,
         horizon_seconds: 1.0,
         uncertainty: Ratio::new(0.1).unwrap(),
@@ -222,6 +237,7 @@ fn expired_prediction_rejected() {
 fn oracle_predictions_cannot_enter_production() {
     let p = Prediction {
         target: "cpu.pressure".into(),
+        predicted_value: 0.0,
         observed_at_seconds: 1.0,
         horizon_seconds: 1.0,
         uncertainty: Ratio::new(0.1).unwrap(),
@@ -248,6 +264,27 @@ pub fn write_jsonl(path: &Path, value: &impl Serialize) -> io::Result<()> {
         .open(path)?;
     serde_json::to_writer(&mut f, value).map_err(io::Error::other)?;
     f.write_all(b"\n")
+}
+pub struct JsonlWriter {
+    writer: BufWriter<fs::File>,
+}
+impl JsonlWriter {
+    pub fn append(path: &Path) -> io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+    pub fn write(&mut self, value: &impl Serialize) -> io::Result<()> {
+        serde_json::to_writer(&mut self.writer, value).map_err(io::Error::other)?;
+        self.writer.write_all(b"\n")
+    }
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 pub fn metadata(command: String, seed: u64) -> RunMetadata {
     RunMetadata {
@@ -334,5 +371,18 @@ mod tests {
     #[test]
     fn oracle_source_is_distinct() {
         assert_ne!(Source::Oracle, Source::Observed);
+    }
+    #[test]
+    fn jsonl_round_trip() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("experiments/data")
+            .join(format!("harm-jsonl-{}.jsonl", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let sample = sample();
+        write_jsonl(&path, &sample).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let decoded: Sample = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(decoded.monotonic_seconds, sample.monotonic_seconds);
+        let _ = fs::remove_file(path);
     }
 }
