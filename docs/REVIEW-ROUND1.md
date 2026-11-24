@@ -1,4 +1,5 @@
 # Round 1 Engineering Review
+> Historical snapshot captured at the end of Round 1. Its “not implemented” statements describe that earlier revision only; current implementation status, tests, and remaining gaps are in `docs/REVIEW-ROUND2.md`.
 
 ## 1. 已完成的文件与模块
 

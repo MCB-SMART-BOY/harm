@@ -2,4 +2,4 @@
 
 Date: 2026-11-24. Status: accepted.
 
-Every future prediction must carry observation time, horizon, expiry, uncertainty, model/device identity, and inference cost. State has exactly one provenance class: observed, predicted, assumed, or oracle. Oracle information is offline-only and must not enter a production controller. This invariant is planned but not yet enforced by a prediction/control API.
+Every prediction carries target/value, observation time, horizon, expiry, uncertainty, model/device identity, inference cost, and provenance. Predictor implementations in `harm::predict` enforce measured synchronous budget results and caller-controlled fallback. Oracle construction is limited to a pre-recorded trace file; Oracle predictions remain offline-only and are rejected by production validation and `WeightController`.

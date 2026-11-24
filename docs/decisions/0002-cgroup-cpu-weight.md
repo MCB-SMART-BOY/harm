@@ -2,4 +2,4 @@
 
 Date: 2026-11-24. Status: accepted.
 
-If/when actuation is enabled, use cgroup v2 `cpu.weight` as the only initial control knob. It is a bounded relative weight; it cannot guarantee CPU shares under every workload, scheduler, or topology. No code currently writes this file. Never modify the host root cgroup.
+The sole actuator implemented this round is cgroup v2 `cpu.weight`, clamped to 1..=10000. It operates only on a HARM-created leaf below a transient, user-delegated `app.slice` scope; `cpu.weight` is restored on normal exit and unwind. Writes are readback-verified, audited, and rolled back on mismatch. The host root cgroup and `user@UID.service` are never written.

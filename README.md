@@ -2,4 +2,4 @@
 
 Heterogeneous Adaptive Resource Manager — research runtime for Linux resource management.
 
-Phase 1 research prototype. Read `docs/research/RESEARCH.md`, `docs/architecture/ARCHITECTURE.md`, and `docs/REVIEW-ROUND1.md` for scope, architecture, and verified limitations.
+Phase 2 host-backed prototype. See `docs/architecture/ARCHITECTURE.md`, `docs/research/RESEARCH.md`, and `docs/REVIEW-ROUND2.md` for implementation status, controls, and measured limitations.
