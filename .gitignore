@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+experiments/data/
+experiments/results/
+*.jsonl.zst
+.direnv/
+result
+.DS_Store
