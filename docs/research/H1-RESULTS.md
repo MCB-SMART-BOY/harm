@@ -74,6 +74,140 @@ bun experiments/matrix-a3-audit.ts "$data/matrix-pilot-2/pilot" \
   "$data/h1-a4-20261125.Yf9SPc/stress-a4" --a4
 ```
 
+### W1 scored sessions and H1 verdict
+
+**H1 FAIL.** Oracle reduced mean spike p99 by **2.157 ms** across 42
+paired blocks (95% CI **[1.844, 2.438] ms**, Cohen's `d_z = 2.162`,
+median relative reduction **99.624%**). The CI was strictly above zero,
+the mean exceeded 1.0 ms, and the effect favored Oracle in both
+sessions. Oracle met the joint SLO on **28/42 (66.67%)**, below the
+90% requirement, and missed **14/42 (33.33%)** CPU deadlines versus
+**7/42 (16.67%)** for Native. Both service criteria failed.
+
+| Session | Scored seeds | Complete / attempted blocks | Mean spike-p99 reduction | Joint SLO pass, Oracle / Native | CPU deadline misses, Oracle / Native |
+|---|---|---:|---:|---:|---:|
+| A | 2001–2021 | 21/21 | 2.216 ms | 16/21 · 0/21 | 5/21 · 4/21 |
+| B | 3001–3021 | 21/21 | 2.098 ms | 12/21 · 1/21 | 9/21 · 3/21 |
+| Pooled | 42 seeds | 42/42 | 2.157 ms | 28/42 · 1/42 | 14/42 · 7/42 |
+
+Each of the five arms ran 42 trials with zero own-arm voids. The void
+ledger is empty, neither session used reserves, and all 42 complete
+blocks had every required H1 score. No Oracle trial qualified for the
+constant-sequence sensitivity analysis. Both sessions ran detached with
+the Stage-0 release binary. On November 25, 2026 in Asia/Shanghai,
+Session A ran 04:31:10–05:20:14 and Session B ran 05:36:21–06:25:31.
+The between-session monotonic interval was **967.738 s**. Pre-trial
+cooldowns were 15.027–15.058 s in A and 15.027–20.057 s in B. All 27
+references per session were generated before scoring, including the
+unused reserves. W2–W4 remained held under the pilot headroom rule.
+
+The 95% CIs use 10,000 whole-block percentile bootstrap resamples
+stratified by session, SplitMix64 seed `20261124`, and the A1 percentile
+index. Oracle's paired joint-pass gain was **64.29 percentage points**
+(95% CI [50.00, 78.57]). The paired CPU miss difference, signed
+Native minus Oracle, was **−16.67 points** (95% CI [−35.71, 2.38]).
+The CPU miss gate compares measured rates. In the 23 pairs with two
+observed CPU completions, the conditional Native-minus-Oracle mean
+was −301.93 ms (95% CI [−908.74, 299.57] ms). Seven Native and 14
+Oracle completions were right-censored at the deadline and counted
+as misses.
+
+| Arm | Burst p99 ≤ 2 ms | Spike p99 ≤ 2 ms | CPU deadline met | Joint SLO met |
+|---|---:|---:|---:|---:|
+| Native | 14/42 | 7/42 | 35/42 | 1/42 |
+| Static-low | 42/42 | 42/42 | 8/42 | 8/42 |
+| Static-high | 0/42 | 0/42 | 39/42 | 0/42 |
+| Reactive | 0/42 | 0/42 | 33/42 | 0/42 |
+| Oracle | 42/42 | 42/42 | 28/42 | 28/42 |
+
+### Scored actuator timing
+
+There were no late first applies (0/168 required), expired weight
+changes (0/4,074 proposals), or stale verified writes (0/4,074 writes).
+Oracle had 0/10,080 forecast ticks tied to expired proposals. No tick
+started at or beyond expiry (0/50,400), and the strict `[0, 50 ms)`
+initial window stayed in effect. Timing includes all attempts. A dash
+indicates unavailable apply latency for Native, which makes no writes.
+The retained analysis also gives active tick compute, apply counts,
+decision-to-apply and apply-to-readback sums, and per-trial overhead
+fractions. Active tick compute includes observation and any apply work
+done inside the tick.
+
+| Arm | First tick lateness median / max A · B (ms) | All tick lateness p99 / max A · B (ms) | Apply→readback p99 / max A · B (ms) |
+|---|---:|---:|---:|
+| Native | 0.306/0.906 · 0.645/0.815 | 0.345/2.174 · 0.373/0.815 | — |
+| Static-low | 0.312/0.711 · 0.291/0.731 | 0.338/0.711 · 0.348/0.731 | 0.712/0.712 · 0.736/0.736 |
+| Static-high | 0.306/0.825 · 0.371/1.209 | 0.350/0.825 · 0.362/1.209 | 0.800/0.800 · 0.726/0.726 |
+| Reactive | 0.265/0.720 · 0.303/0.740 | 0.376/0.812 · 0.360/0.740 | 0.608/0.938 · 0.611/1.876 |
+| Oracle | 0.291/0.737 · 0.352/0.735 | 0.345/0.737 · 0.363/0.870 | 0.883/0.883 · 0.718/0.718 |
+
+### Environment, realized orders, and scope of inference
+
+Before, between, and after the sessions, LM Studio reported PID `220106`
+serving the same 94.58 GB `qwen3.8-flash-next@iq4_xs` model with context
+262144. The residency checks reported idle, an empty queue and unchanged
+last-use time through reference preparation and both scored sessions.
+The host used kernel `7.3.0-78-omarchy` with AC online at all sampled
+boundaries and the `performance` governor on CPUs 0–3. Platform power
+profile and whole-machine energy were unavailable. Boundary snapshots
+recorded CPU, memory, and I/O pressure. Per-trial before-warmup and
+after-drain observations showed RSS of 74.62 GiB, 2.93–4.54 GiB available
+RAM, 0–4 trial-process major faults, CPU sensor readings of 36–48 °C,
+and GPU readings of 40–43 °C at 2340–2346 MHz. Host swap-out counters
+rose by 21 pages in A and 41,941 in B over the trial-snapshot spans.
+
+Realized order uses `N` for Native, `L` for Static-low, `H` for
+Static-high, `R` for Reactive, and `O` for Oracle.
+
+```text
+2001 O N R H L    3001 O H R N L
+2002 H N R L O    3002 N R O L H
+2003 R L N O H    3003 O N R L H
+2004 N R L O H    3004 H L R O N
+2005 N O L H R    3005 R O N L H
+2006 N O H R L    3006 L N R H O
+2007 O N R L H    3007 H R O L N
+2008 O H L R N    3008 N O L R H
+2009 O R N L H    3009 H O R N L
+2010 H N O R L    3010 R N H O L
+2011 O N R L H    3011 N O L R H
+2012 L O R N H    3012 N H L R O
+2013 N R O L H    3013 L O R H N
+2014 N O L R H    3014 O H N R L
+2015 N H R L O    3015 O N L R H
+2016 H L N O R    3016 H R O L N
+2017 R N L H O    3017 H L R N O
+2018 H L O N R    3018 N L R O H
+2019 L N H R O    3019 L N O H R
+2020 O R L H N    3020 H L O R N
+2021 R H L N O    3021 H N L R O
+```
+
+The inference applies to observed W1 outcomes on this single host with
+the controller pinned separately and the LLM resident-idle. Oracle met
+both latency thresholds in all 42 trials, but CPU completion limited
+joint service. The H1 gate for ML remains unmet. A production
+predictor, other workloads, other residency states, and battery energy
+effects require separate evidence. The Stage-0 estimate combined fresh
+dynamic-arm stress with historical Native and static data as specified
+in A4. The scored runs followed the A4 design.
+
+The manifests, raw traces, environment records, and `h1-analysis.json`
+are in the run directory above. This command reproduces the analysis.
+
+```sh
+run="$HOME/Projects/harm/experiments/data/h1-a4-20261125.Yf9SPc"
+bun experiments/matrix-h1-analysis.ts "$run"
+```
+
+Final validation passed `cargo fmt --all`, `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace -- --nocapture`. All three host integration
+tests ran and passed. The slow `actuator_power_cli_completes_and_writes_summaries`
+test was ignored as declared. The scope check after validation found
+zero remaining HARM scopes. The logs are in `validation/` in the run
+directory.
+
 ## A3 re-audit and H1 verdict (2026-11-25)
 
 **Stage 0 FAIL. H1 gate FAIL at the validity prerequisite.** The A3 pilot

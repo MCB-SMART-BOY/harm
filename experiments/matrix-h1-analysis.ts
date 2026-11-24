@@ -14,14 +14,25 @@ const read = (path: string) => lines(readFileSync(path, "utf8"));
 type Trial = {
   arm: string;
   order_index: number;
-  trace_file: string;
+  trace_file: string | { Unix: number[] };
   void_reasons: string[];
   joint_slo_pass: boolean | null;
   phase_p99_ns: { spike: number } | null;
   background_completion: { missed_deadline: boolean; elapsed_ns: number | null } | null;
   expiry_metrics: Record<string, number> | null;
+  after_drain: Environment | null;
+  constant_sequence_sensitivity_eligible?: boolean;
 };
 type Block = { seed: number; reserve: boolean; complete: boolean; trials: Trial[] };
+type Environment = {
+  major_faults: number | null;
+  meminfo: string[];
+  memory_psi: string | null;
+  swap: string[];
+  resident_llm: { pid: number; rss_kib: number | null; cpu_ticks: number | null }[];
+  temperatures_c: Record<string, number>;
+  gpu_temperature_c_and_clock_mhz: string | null;
+};
 
 function result(session: string, startSeed: number) {
   const path = join(run, "sessions", session, "session.jsonl");
@@ -44,7 +55,10 @@ function result(session: string, startSeed: number) {
   const residencyOK = environment.some(row => row.label === "before")
     && environment.some(row => row.label === "after")
     && environment.every(row => row.label !== "residency check failed");
-  return { session, start, end, blocks, complete, residencyOK };
+  return {
+    session, start, end, blocks, complete, residencyOK, environment,
+    cooldownStopped: rows.find(row => row.kind === "matrix_cooldown_failed") ?? null,
+  };
 }
 
 function ratio(numerator: number, denominator: number) {
@@ -95,6 +109,8 @@ function score(block: Block) {
   assert(typeof reference === "number" && typeof test === "number");
   assert(typeof referenceMiss === "boolean" && typeof testMiss === "boolean");
   assert(typeof oracle.joint_slo_pass === "boolean" && typeof native.joint_slo_pass === "boolean");
+  const nativeCpuNs = native.background_completion!.elapsed_ns;
+  const oracleCpuNs = oracle.background_completion!.elapsed_ns;
   const diffMs = (reference - test) / 1e6;
   return {
     seed: block.seed,
@@ -104,12 +120,27 @@ function score(block: Block) {
     native_pass: native.joint_slo_pass,
     oracle_miss: testMiss,
     native_miss: referenceMiss,
+    oracle_cpu_ms: oracleCpuNs === null ? null : oracleCpuNs / 1e6,
+    native_cpu_ms: nativeCpuNs === null ? null : nativeCpuNs / 1e6,
   };
 }
 
-function controllerTiming(session: string, trials: Trial[]) {
+function describe(samples: number[]) {
+  return {
+    count: samples.length,
+    median: median(samples),
+    p99: percentile(samples, 0.99),
+    max: samples.reduce<number | null>((max, value) => Math.max(max ?? value, value), null),
+  };
+}
+
+function controllerTiming(session: string, trials: Trial[], environment: Environment[]) {
   const ticks: number[] = [];
+  const firstTicks: number[] = [];
   const applies: number[] = [];
+  const activeCompute: number[] = [];
+  const decisionToApply: number[] = [];
+  const overheadPercent: number[] = [];
   let initialWindowMisses = 0;
   let measured = 0;
   let staleApplies = 0;
@@ -118,15 +149,23 @@ function controllerTiming(session: string, trials: Trial[]) {
     forecasts_with_expired_proposal_count: 0, forecast_count: 0,
   };
   for (const trial of trials) {
-    if (!trial.expiry_metrics) continue;
-    const path = join(run, "sessions", session, trial.trace_file);
+    const name = typeof trial.trace_file === "string"
+      ? trial.trace_file : Buffer.from(trial.trace_file.Unix).toString("utf8");
+    const path = join(run, "sessions", session, name);
+    if (!existsSync(path)) continue;
     const head = Bun.spawnSync(["head", "-n", "256", path]);
     assert.equal(head.exitCode, 0, path);
-    const tickRows = lines(head.stdout.toString()).filter(row => row.kind === "control_tick");
+    const rows = lines(head.stdout.toString());
+    const beforeWarmup = rows.find(row => row.kind === "matrix_trial_meta")?.before_warmup;
+    if (beforeWarmup) environment.push(beforeWarmup);
+    if (trial.after_drain) environment.push(trial.after_drain);
+    if (!trial.expiry_metrics) continue;
+    const tickRows = rows.filter(row => row.kind === "control_tick");
     assert.equal(tickRows.length, 240, path);
     const audit = read(path.replace(/\.jsonl$/, ".audit.jsonl"));
     for (const key of Object.keys(expiry) as Array<keyof typeof expiry>) expiry[key] += trial.expiry_metrics[key];
     const first = tickRows.find(tick => tick.applied !== null);
+    firstTicks.push(tickRows[0].tick_lateness_ns);
     if (trial.arm !== "native") {
       measured++;
       if (!first || first.applied.elapsed_ns >= interval) initialWindowMisses++;
@@ -136,26 +175,63 @@ function controllerTiming(session: string, trials: Trial[]) {
       ticks.push(tick.tick_lateness_ns);
       if (tick.applied?.elapsed_ns >= tick.scheduled_ns + interval) staleApplies++;
     }
+    activeCompute.push(tickRows.reduce((sum, tick) => sum + tick.decision_end_ns - tick.decision_start_ns, 0));
+    let trialOverheadNs = 0;
+    let verified = 0;
     for (const row of audit.filter(row => row.event === "apply")) {
-      const { apply_started_seconds: from, readback_completed_seconds: to } = row.action_timing;
+      const { decision_started_seconds: decision, apply_started_seconds: from, readback_completed_seconds: to } = row.action_timing;
       applies.push(Math.round((to - from) * 1e9));
+      decisionToApply.push(Math.round((from - decision) * 1e9));
+      trialOverheadNs += (to - decision) * 1e9;
+      verified++;
     }
+    if (verified) overheadPercent.push(100 * trialOverheadNs / (tickRows.length * interval));
   }
-  const describe = (samples: number[]) => ({
-    count: samples.length,
-    p99_ns: percentile(samples, 0.99),
-    max_ns: samples.reduce<number | null>((max, value) => Math.max(max ?? value, value), null),
-  });
   return {
     attempts: trials.length,
     voids: trials.filter(trial => trial.void_reasons.length > 0).length,
     expired_proposals: ratio(expiry.expired_proposal_count, expiry.weight_change_proposal_count),
     forecast_expiries: ratio(expiry.forecasts_with_expired_proposal_count, expiry.forecast_count),
     initial_window_misses: ratio(initialWindowMisses, measured),
-    stale_applies: staleApplies,
+    stale_applies: ticks.length ? staleApplies : null,
     late_ticks: ratio(ticks.filter(ns => ns >= interval).length, ticks.length),
-    tick_lateness: describe(ticks),
-    apply_to_readback: describe(applies),
+    first_tick_lateness_ns: describe(firstTicks),
+    tick_lateness_ns: describe(ticks),
+    apply_to_readback_ns: describe(applies),
+    active_tick_compute_ns_per_trial: describe(activeCompute),
+    apply_overhead_percent_of_trial: describe(overheadPercent),
+    decision_to_apply_sum_ns: decisionToApply.length ? decisionToApply.reduce((sum, ns) => sum + ns, 0) : null,
+    apply_to_readback_sum_ns: applies.length ? applies.reduce((sum, ns) => sum + ns, 0) : null,
+  };
+}
+
+function summarizeEnvironment(samples: Environment[]) {
+  const range = (values: unknown[]) => {
+    const observed = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+    return observed.length ? { min: Math.min(...observed), max: Math.max(...observed) } : null;
+  };
+  const counter = (rows: string[], pattern: RegExp) => {
+    const match = rows.map(line => line.match(pattern)).find(result => result !== null);
+    return match ? Number(match[1]) : null;
+  };
+  const resident = samples.flatMap(sample => sample.resident_llm ?? []);
+  const gpu = samples.map(sample => sample.gpu_temperature_c_and_clock_mhz?.match(/^(\d+),\s*(\d+)/));
+  const sensors = new Set(samples.flatMap(sample => Object.keys(sample.temperatures_c ?? {})));
+  return {
+    snapshots: samples.length,
+    resident_pid: [...new Set(resident.map(row => row.pid))],
+    resident_rss_kib: range(resident.map(row => row.rss_kib)),
+    resident_cpu_ticks: range(resident.map(row => row.cpu_ticks)),
+    available_kib: range(samples.map(row => counter(row.meminfo ?? [], /^MemAvailable:\s*(\d+)/))),
+    free_kib: range(samples.map(row => counter(row.meminfo ?? [], /^MemFree:\s*(\d+)/))),
+    major_faults: range(samples.map(row => row.major_faults)),
+    swap_in_pages: range(samples.map(row => counter(row.swap ?? [], /^pswpin\s+(\d+)/))),
+    swap_out_pages: range(samples.map(row => counter(row.swap ?? [], /^pswpout\s+(\d+)/))),
+    memory_psi_full_total_us: range(samples.map(row => counter(row.memory_psi?.split("\n") ?? [], /^full.* total=(\d+)/))),
+    temperatures_c: Object.fromEntries([...sensors].map(sensor =>
+      [sensor, range(samples.map(row => row.temperatures_c?.[sensor]))])),
+    gpu_temperature_c: range(gpu.map(match => match ? Number(match[1]) : null)),
+    gpu_clock_mhz: range(gpu.map(match => match ? Number(match[2]) : null)),
   };
 }
 
@@ -181,6 +257,8 @@ const oracleMiss = ratio(scores.filter(score => score.oracle_miss).length, score
 const nativeMiss = ratio(scores.filter(score => score.native_miss).length, scores.length);
 const cpuMissDiff = cohort.map(rows => rows.map(row => 100 * (Number(row.native_miss) - Number(row.oracle_miss))));
 const jointPassDiff = cohort.map(rows => rows.map(row => 100 * (Number(row.oracle_pass) - Number(row.native_pass))));
+const observedCpuDiff = cohort.map(rows => rows.flatMap(row =>
+  row.native_cpu_ms === null || row.oracle_cpu_ms === null ? [] : [row.native_cpu_ms - row.oracle_cpu_ms]));
 const conditions = {
   quota: sessions.every(session => session.complete.length === quota && session.end !== null),
   session_gap: gap !== null && gap >= 900,
@@ -204,17 +282,35 @@ console.log(JSON.stringify({
   oracle_pass: oraclePass, native_pass: nativePass, oracle_cpu_miss: oracleMiss, native_cpu_miss: nativeMiss,
   joint_pass_gain_percentage_points: { mean: mean(jointPassDiff.flat()), ci_95: bootstrap(jointPassDiff) },
   cpu_miss_gain_percentage_points: { mean: mean(cpuMissDiff.flat()), ci_95: bootstrap(cpuMissDiff) },
-  sessions: sessions.map(({ session, start, end, blocks, complete, residencyOK }, i) => ({
-    session, start, end, residency_ok: residencyOK,
-    complete_blocks: complete.length,
-    attempted_blocks: blocks.length,
-    mean_spike_p99_improvement_ms: mean(strata[i]),
-    pairs: cohort[i],
-    realized_order: blocks.map(({ seed, reserve, complete, trials }) =>
-      ({ seed, reserve, complete, arms: trials.map(trial => trial.arm) })),
-    void_ledger: blocks.flatMap(block => block.trials.filter(trial => trial.void_reasons.length > 0)
-      .map(trial => ({ seed: block.seed, arm: trial.arm, reasons: trial.void_reasons }))),
-    controller: Object.fromEntries(arms.map(arm => [arm, controllerTiming(session,
-      blocks.flatMap(block => block.trials.filter(trial => trial.arm === arm)))])),
-  })),
+  cpu_completion_conditional_ms: {
+    observed_pairs: observedCpuDiff.flat().length,
+    native_censored: scores.filter(row => row.native_cpu_ms === null).length,
+    oracle_censored: scores.filter(row => row.oracle_cpu_ms === null).length,
+    paired_mean_improvement: mean(observedCpuDiff.flat()), ci_95: bootstrap(observedCpuDiff),
+  },
+  sessions: sessions.map(({ session, start, end, blocks, complete, residencyOK, environment, cooldownStopped }, i) => {
+    const trialEnvironment: Environment[] = [];
+    const controller = Object.fromEntries(arms.map(arm => [arm, controllerTiming(session,
+      blocks.flatMap(block => block.trials.filter(trial => trial.arm === arm)), trialEnvironment)]));
+    return {
+      session, start, end, cooldown_stopped: cooldownStopped, residency_ok: residencyOK,
+      complete_blocks: complete.length,
+      attempted_blocks: blocks.length,
+      mean_spike_p99_improvement_ms: mean(strata[i]),
+      oracle_pass: ratio(cohort[i].filter(score => score.oracle_pass).length, complete.length),
+      native_pass: ratio(cohort[i].filter(score => score.native_pass).length, complete.length),
+      oracle_cpu_miss: ratio(cohort[i].filter(score => score.oracle_miss).length, complete.length),
+      native_cpu_miss: ratio(cohort[i].filter(score => score.native_miss).length, complete.length),
+      pairs: cohort[i],
+      realized_order: blocks.map(({ seed, reserve, complete, trials }) =>
+        ({ seed, reserve, complete, arms: trials.map(trial => trial.arm) })),
+      void_ledger: blocks.flatMap(block => block.trials.filter(trial => trial.void_reasons.length > 0)
+        .map(trial => ({ seed: block.seed, arm: trial.arm, reasons: trial.void_reasons }))),
+      constant_sequence_sensitivity_seeds: blocks.filter(block => block.trials.some(trial =>
+        trial.constant_sequence_sensitivity_eligible)).map(block => block.seed),
+      controller,
+      boundary_environment: environment,
+      trial_environment: summarizeEnvironment(trialEnvironment),
+    };
+  }),
 }, null, 2));
