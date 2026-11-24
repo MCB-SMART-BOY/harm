@@ -1,6 +1,9 @@
 /target
 **/*.rs.bk
-experiments/data/
+# Run data is generated locally and kept out of git, EXCEPT the small canonical
+# samples under experiments/data/samples/ (one trimmed real trace per run type).
+experiments/data/*
+!experiments/data/samples/
 experiments/results/
 *.jsonl.zst
 .direnv/

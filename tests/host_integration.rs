@@ -93,10 +93,14 @@ fn delegated_scope_control_changes_reads_restores_and_audits() {
             .iter()
             .any(|row| row["event"] == "apply" && row["readback"] == 237)
     );
+    // The restore event must be reconstructable: it records the applied weight (237)
+    // as `before` and the original default (100) as `after`, not a null before.
     assert!(
-        audit_rows
-            .iter()
-            .any(|row| row["event"] == "restore" && row["result"] == "restored")
+        audit_rows.iter().any(|row| row["event"] == "restore"
+            && row["result"] == "restored"
+            && row["before"] == 237
+            && row["after"] == 100),
+        "restore event must record before=237 (applied) and after=100 (original): {audit_rows:?}"
     );
     let _ = fs::remove_file(audit);
 }

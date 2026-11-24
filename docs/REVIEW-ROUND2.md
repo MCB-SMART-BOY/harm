@@ -201,6 +201,8 @@ Phase 3 Oracle upper-bound workload study：同一阶段负载、PSI、动作空
 - no RAPL/powercap、no NPU；whole-machine energy 与异构 NPU offload 结果缺失。GPU 功耗 query 不是 RAPL 替代品。
 - Related Work 文件本轮未修改且仍有 `UNVERIFIED` 单元；无 novelty claim。
 - CI 仅 x86_64 ubuntu-latest；当前 host tests 覆盖 aarch64 环境，不等于多机/多拓扑验证。
+- **审计保真缺陷（本轮已修）**：`restore` 事件此前写 `"before":null`，只记录恢复到的目标值而不记录恢复前的生效值，导致审计链无法重建"从多少恢复到多少"。现 `restore_all` 与 `Drop` 在写回前先读当前生效权重写入 `before`（如 apply=237 则 restore 记 `before:237, after:100`）；新增单元测试 `restore_event_records_applied_value_as_before` 断言 `before==applied && after==original`，集成测试同步断言真实 scope 上 `before==237 && after==100`。
+- **数据跟踪/忽略不一致（本轮已修）**：`experiments/data/*.jsonl` 既被 `.gitignore` 的 `experiments/data/` 整目录忽略，又存在被纳入版本控制的运行副本风险，二者语义冲突。现统一为单一策略：`.gitignore` 改为 `experiments/data/*` + 唯一 re-include `!experiments/data/samples/`，仅保留每类一次真实裁剪样本（control/bench-audit/bench-trace/collect），其余全部忽略；策略与样本来源写入 `experiments/README.md`。
 
 ## 8. 下一阶段任务
 

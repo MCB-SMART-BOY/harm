@@ -504,6 +504,10 @@ impl<I: CgroupIo> WeightController<I> {
             .map(|(path, original)| (path.clone(), *original))
             .collect();
         for (path, original) in &entries {
+            // Read the value currently in effect so the audit trail records what we
+            // are restoring *from* (normally the applied weight), not just where we
+            // end up. A restore that omits `before` is non-reconstructable.
+            let current = self.io.read_weight(path).ok();
             self.io
                 .write_weight(path, *original)
                 .map_err(|e| classify_cgroup_io(&e, format!("restore {}", path.display())))?;
@@ -516,7 +520,7 @@ impl<I: CgroupIo> WeightController<I> {
                     "restore",
                     path,
                     Some(*original),
-                    None,
+                    current,
                     Some(*original),
                     Some(readback),
                     if readback == *original {
@@ -542,6 +546,7 @@ impl<I: CgroupIo> WeightController<I> {
 impl<I: CgroupIo> Drop for WeightController<I> {
     fn drop(&mut self) {
         for (path, original) in &self.originals {
+            let current = self.io.read_weight(path).ok();
             let result = self
                 .io
                 .write_weight(path, *original)
@@ -563,7 +568,7 @@ impl<I: CgroupIo> Drop for WeightController<I> {
                     "restore",
                     path,
                     Some(*original),
-                    None,
+                    current,
                     Some(*original),
                     readback,
                     status,
@@ -944,8 +949,13 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::write(path.join("cpu.weight"), "100").unwrap();
         let audit_path = dir.join("audit.jsonl");
+        // Fake.write_weight ignores the target path and mutates this shared cell, so if
+        // the controller had written anything the value would move off 100 no matter
+        // which cgroup was named. Holding a handle is what turns "an error came back"
+        // into proof that no write occurred: the refusal must be a real no-op.
+        let value = Arc::new(Mutex::new(100));
         let backend = Fake {
-            value: Arc::new(Mutex::new(100)),
+            value: value.clone(),
             mismatch: false,
         };
         let mut ctl = manager(backend, &dir.join("allowed"), &audit_path);
@@ -953,6 +963,7 @@ mod tests {
             ctl.apply(&action(&path, 200), options(false, 1.0, false)),
             Err(ControlError::PathNotWhitelisted(_))
         ));
+        assert_eq!(*value.lock().unwrap(), 100, "refused action must not write");
         assert!(fs::read_to_string(&audit_path).unwrap().contains("refused"));
         let _ = fs::remove_dir_all(dir);
     }
@@ -1018,6 +1029,39 @@ mod tests {
         ));
         ctl.restore_all().unwrap();
         assert_eq!(*value.lock().unwrap(), 500);
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn restore_event_records_applied_value_as_before() {
+        let dir = test_dir("restore-audit");
+        let value = Arc::new(Mutex::new(100));
+        let backend = Fake {
+            value: value.clone(),
+            mismatch: false,
+        };
+        let audit_path = dir.join("audit.jsonl");
+        let mut ctl = manager(backend, &dir, &audit_path);
+        // Apply 237 so the weight in effect just before restore is 237.
+        ctl.apply(&action(&dir, 237), options(false, 1.0, false))
+            .unwrap();
+        assert_eq!(*value.lock().unwrap(), 237);
+        ctl.restore_all().unwrap();
+        let rows: Vec<serde_json::Value> = fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let restore = rows
+            .iter()
+            .find(|row| row["event"] == "restore")
+            .expect("restore audit event");
+        assert_eq!(
+            restore["before"], 237,
+            "restore must record the applied value it restored from"
+        );
+        assert_eq!(restore["after"], 100);
+        assert_eq!(restore["readback"], 100);
+        assert_eq!(restore["result"], "restored");
         let _ = fs::remove_dir_all(dir);
     }
     #[test]

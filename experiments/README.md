@@ -15,4 +15,17 @@ Run data JSONL starts with wall-clock metadata (exact argv, host, kernel, CPU on
 
 Optional `--gpu-probe` runs `nvidia-smi --query-gpu=utilization.gpu,clocks.sm,power.draw --format=csv,noheader`; probing can wake the GPU, and its duration/result are recorded. It is off by default. A failed command yields `Unavailable`, not zero. GPU power is not whole-machine energy. This host has no NPU or powercap/RAPL, so no NPU or CPU-energy result can be collected here.
 
-Generated files live under ignored `experiments/data/`; copy them, stdout, `rustc --version`, and environmental controls (temperature/power profile/background services/cache warmth) to a separate retained run archive. The control demo proves one cgroup write/readback/restore cycle, not allocation benefit. The phase bench is a real CPU workload plus latency-under-load instrumentation, but not an application SLO or policy comparison. For studies, randomize paired policy order, use identical workload/seed/action space/observation cadence, pre-register repetitions/statistics, and report confidence intervals and exclusions. Oracle inputs must come only from pre-recorded future traces.
+## Data retention policy
+
+Everything under `experiments/data/` is git-ignored **except** the small canonical samples in `experiments/data/samples/`. `.gitignore` enforces this with one rule pair — `experiments/data/*` then a single `!experiments/data/samples/` re-include — so no run file can ever be both tracked and ignored. There are intentionally no other committed copies of run data.
+
+The committed samples are trimmed excerpts of **real host runs**, not synthetic fixtures:
+
+- `control.jsonl` — one full control-experiment audit (scope_created → apply 100→237 → restore).
+- `bench-audit.jsonl` — one bench apply/restore audit (apply 100→200, restore from 200 to 100).
+- `bench-trace.jsonl` — the metadata header, every phase marker, the first two latency samples per phase, and the summary line (the full run is ~186k lines; only this representative slice is committed).
+- `collect.jsonl` — a short real `collect --gpu-probe`.
+
+Every `restore` audit event records the weight it restored *from* in `before` (e.g. 237) and the original default in `after`, so the trail is reconstructable; an earlier build wrote `"before":null` here.
+
+Full runs stay out of git: copy them, stdout, `rustc --version`, and environmental controls (temperature/power profile/background services/cache warmth) to a separate retained run archive. The control demo proves one cgroup write/readback/restore cycle, not allocation benefit. The phase bench is a real CPU workload plus latency-under-load instrumentation, but not an application SLO or policy comparison. For studies, randomize paired policy order, use identical workload/seed/action space/observation cadence, pre-register repetitions/statistics, and report confidence intervals and exclusions. Oracle inputs must come only from pre-recorded future traces.
