@@ -1,7 +1,15 @@
 use clap::{Parser, Subcommand};
-use harm::{capabilities, metadata, percentile, sample, write_jsonl};
+use harm::{
+    JsonlWriter,
+    bench::{burn_blocked_child, launch_scoped_bench, phase_duration_args, run_scoped_bench},
+    capabilities,
+    control::{launch_delegated, run_control_experiment, unique_unit},
+    metadata, sample_with_gpu_probe,
+    telemetry::BoundedRing,
+    write_jsonl,
+};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -26,31 +34,118 @@ enum Command {
         interval: String,
         #[arg(long, default_value = "experiments/data/collect.jsonl")]
         output: PathBuf,
+        #[arg(long)]
+        gpu_probe: bool,
     },
     Bench {
-        #[arg(long, default_value = "3")]
-        seconds: u64,
+        #[arg(long)]
+        phases: bool,
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 2)]
+        threads: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 200)]
+        weight: u32,
+        #[arg(long)]
+        phase_durations: Option<String>,
         #[arg(long, default_value = "experiments/data/bench.jsonl")]
         output: PathBuf,
-        #[arg(long, default_value_t = 1)]
+    },
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
+    #[command(name = "__control", hide = true)]
+    InternalControl {
+        #[arg(long)]
+        unit: String,
+        #[arg(long)]
+        weight: u32,
+        #[arg(long)]
+        audit: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        workload_ms: u64,
+    },
+    #[command(name = "__bench", hide = true)]
+    InternalBench {
+        #[arg(long)]
+        unit: String,
+        #[arg(long)]
+        seconds: f64,
+        #[arg(long)]
+        threads: usize,
+        #[arg(long)]
         seed: u64,
+        #[arg(long)]
+        weight: u32,
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long)]
+        phase_durations: Option<String>,
+    },
+    #[command(name = "__burn", hide = true)]
+    InternalBurn {
+        #[arg(long)]
+        phase_plan: String,
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
     },
     Report {
         #[arg(default_value = "experiments/data/collect.jsonl")]
         input: PathBuf,
     },
 }
-fn parse_duration(s: &str) -> Duration {
-    let (n, u) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(s.len()),
-    );
-    let x = n.parse::<f64>().unwrap_or(1.0);
-    match u {
-        "ms" => Duration::from_secs_f64(x / 1000.0),
-        "m" => Duration::from_secs_f64(x * 60.0),
-        _ => Duration::from_secs_f64(x),
+#[derive(Subcommand)]
+enum ControlCommand {
+    Experiment {
+        #[arg(long, default_value_t = 237)]
+        weight: u32,
+        #[arg(long, default_value = "experiments/data/control-audit.jsonl")]
+        audit: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        workload_ms: u64,
+    },
+}
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let amount = number.parse::<f64>().map_err(|e| e.to_string())?;
+    if !amount.is_finite() || amount < 0.0 {
+        return Err("duration must be finite and nonnegative".into());
     }
+    let seconds = match unit {
+        "ms" => amount / 1000.0,
+        "s" | "" => amount,
+        "m" => amount * 60.0,
+        _ => return Err(format!("unsupported duration unit {unit}")),
+    };
+    Ok(Duration::from_secs_f64(seconds))
+}
+fn launch_control(weight: u32, audit: &Path, workload_ms: u64) -> Result<(), String> {
+    let unit = unique_unit();
+    if let Some(parent) = audit.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let args = vec![
+        "__control".into(),
+        "--unit".into(),
+        unit.clone(),
+        "--weight".into(),
+        weight.to_string(),
+        "--audit".into(),
+        audit.to_string_lossy().into_owned(),
+        "--workload-ms".into(),
+        workload_ms.to_string(),
+    ];
+    launch_delegated(&executable, &unit, &args)
+        .map_err(|e| format!("delegated experiment failed: {e:?}"))?;
+    println!("transient_scope_removed=true unit={unit}");
+    Ok(())
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -63,90 +158,154 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default()
                     .trim()
             );
-            for (n, ok) in capabilities() {
+            for (name, available) in capabilities() {
                 println!(
-                    "{n}: {}",
-                    if ok {
+                    "{name}: {}",
+                    if available {
                         "available"
                     } else {
-                        match n {
+                        match name {
                             "powercap" => "UNAVAILABLE (no powercap/RAPL)",
                             "accel" => "UNAVAILABLE (no NPU/accel)",
-                            "cpufreq" => "UNAVAILABLE (no cpufreq)",
                             _ => "UNAVAILABLE",
                         }
                     }
-                )
+                );
             }
-            println!("GPU: detected via /dev/nvidia0 only; utilization unavailable");
+            println!(
+                "GPU: detected through /dev/nvidia0 only; utilization unavailable unless --gpu-probe is requested"
+            );
         }
         Command::Collect {
             duration,
             interval,
             output,
+            gpu_probe,
         } => {
-            std::fs::create_dir_all(output.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
+            std::fs::create_dir_all(output.parent().unwrap_or_else(|| Path::new(".")))?;
             std::fs::File::create(&output)?;
             write_jsonl(
                 &output,
                 &metadata(std::env::args().collect::<Vec<_>>().join(" "), 0),
             )?;
-            let total = parse_duration(&duration);
-            let step = parse_duration(&interval).max(Duration::from_millis(1));
+            let mut writer = JsonlWriter::append(&output)?;
+            let total = parse_duration(&duration).map_err(std::io::Error::other)?;
+            let step = parse_duration(&interval)
+                .map_err(std::io::Error::other)?
+                .max(Duration::from_millis(1));
             let start = Instant::now();
+            let mut count = 0usize;
+            let mut ring = BoundedRing::new(128).map_err(std::io::Error::other)?;
             while start.elapsed() < total {
-                write_jsonl(&output, &sample())?;
+                let sample = sample_with_gpu_probe(gpu_probe);
+                writer.write(&sample)?;
+                ring.push(sample);
+                count += 1;
                 thread::sleep(step);
             }
+            writer.flush()?;
             println!(
-                "wrote {} samples to {}",
-                (start.elapsed().as_millis() / step.as_millis().max(1)),
+                "samples={count} ring_capacity={} ring_dropped={} gpu_probe={} trace={}",
+                ring.capacity(),
+                ring.dropped(),
+                gpu_probe,
                 output.display()
             );
         }
         Command::Bench {
+            phases,
             seconds,
-            output,
+            threads,
             seed,
+            weight,
+            phase_durations,
+            output,
         } => {
-            std::fs::create_dir_all(output.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
-            std::fs::File::create(&output)?;
-            write_jsonl(
-                &output,
-                &metadata(std::env::args().collect::<Vec<_>>().join(" "), seed),
-            )?;
-            let until = Instant::now() + Duration::from_secs(seconds);
-            let mut lats = Vec::new();
-            let mut i = 0u64;
-            while Instant::now() < until {
-                let d = Duration::from_millis(if i.is_multiple_of(4) { 5 } else { 1 });
-                let start = Instant::now();
-                thread::sleep(d);
-                let ns = start.elapsed().as_nanos();
-                lats.push(ns);
-                write_jsonl(
-                    &output,
-                    &serde_json::json!({"kind":"latency_probe","seed":seed,"iteration":i,"requested_sleep_ns":d.as_nanos(),"round_trip_ns":ns}),
-                )?;
-                i = i.wrapping_add(1);
+            if !phases {
+                return Err(
+                    "round-two bench requires --phases; bare timer probe is intentionally not used"
+                        .into(),
+                );
             }
-            lats.sort_unstable();
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err("--seconds must be positive and finite".into());
+            }
+            let durations = phase_durations
+                .as_deref()
+                .map(phase_duration_args)
+                .transpose()
+                .map_err(std::io::Error::other)?;
+            std::fs::create_dir_all(output.parent().unwrap_or_else(|| Path::new(".")))?;
+            launch_scoped_bench(
+                &std::env::current_exe()?,
+                Duration::from_secs_f64(seconds),
+                threads,
+                seed,
+                weight,
+                &output,
+                durations,
+            )
+            .map_err(std::io::Error::other)?;
             println!(
-                "latency round-trip ns: p50={} p95={} p99={} samples={}",
-                percentile(&lats, 0.50),
-                percentile(&lats, 0.95),
-                percentile(&lats, 0.99),
-                lats.len()
+                "bench_trace={} delegated_scope_removed=true",
+                output.display()
             );
         }
+        Command::Control {
+            command:
+                ControlCommand::Experiment {
+                    weight,
+                    audit,
+                    workload_ms,
+                },
+        } => launch_control(weight, &audit, workload_ms).map_err(std::io::Error::other)?,
+        Command::InternalControl {
+            unit,
+            weight,
+            audit,
+            workload_ms,
+        } => run_control_experiment(&unit, weight, &audit, workload_ms)
+            .map_err(std::io::Error::other)?,
+        Command::InternalBench {
+            unit,
+            seconds,
+            threads,
+            seed,
+            weight,
+            trace,
+            phase_durations,
+        } => {
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err("internal bench duration invalid".into());
+            }
+            let durations = phase_durations
+                .as_deref()
+                .map(phase_duration_args)
+                .transpose()
+                .map_err(std::io::Error::other)?;
+            let _ = run_scoped_bench(
+                &unit,
+                Duration::from_secs_f64(seconds),
+                threads,
+                seed,
+                weight,
+                &trace,
+                durations,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        Command::InternalBurn {
+            phase_plan,
+            threads,
+        } => burn_blocked_child(&phase_plan, threads).map_err(std::io::Error::other)?,
         Command::Report { input } => {
             let text = std::fs::read_to_string(&input)?;
             let mut lines = text.lines();
             let header: serde_json::Value = serde_json::from_str(lines.next().unwrap_or("{}"))?;
             println!(
-                "file={} samples={} host={} arch={} kernel={} seed={} command={}",
+                "file={} records={} host={} architecture={} kernel={} command={}",
                 input.display(),
-                sample_count,
+                lines.count(),
                 header["host"],
                 header["architecture"],
                 header["kernel"],
