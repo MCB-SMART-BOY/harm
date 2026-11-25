@@ -1322,8 +1322,8 @@ mod tests {
         };
         let mut ctl = manager(backend, &dir, &dir.join("audit.jsonl"));
         let mut proposal = action(&dir, 200);
-        proposal.expires_at_seconds = crate::monotonic_seconds();
-        let decision_seconds = proposal.expires_at_seconds - 0.001;
+        let decision_seconds = crate::monotonic_seconds();
+        proposal.expires_at_seconds = decision_seconds - 1.0;
         let result = ctl.apply(&proposal, options(false, decision_seconds, false));
         let actual = *value.lock().unwrap();
         ctl.restore_all().unwrap();
