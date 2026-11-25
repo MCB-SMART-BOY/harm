@@ -1,10 +1,12 @@
-use crate::{Prediction, Ratio, Seconds, Source};
+use crate::{Prediction, PredictionCalibration, Ratio, Seconds, Source};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
-    time::Instant,
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -34,15 +36,14 @@ pub struct MetaAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PredictError {
     Timeout { elapsed: Seconds },
+    Busy,
+    WorkerUnavailable,
     NoObservation,
     InvalidTrace(String),
     Io(String),
     InvalidOutput,
 }
 pub trait Predictor: Send + Sync {
-    fn oracle_only(&self) -> bool {
-        false
-    }
     fn predict(
         &self,
         window: &ObservationWindow,
@@ -66,6 +67,11 @@ fn prediction(
         observed_at_seconds: observation.observed_at_seconds,
         horizon_seconds: action.horizon.get(),
         uncertainty: Ratio::new(uncertainty).ok_or(PredictError::InvalidOutput)?,
+        calibration: if source.is_oracle() {
+            PredictionCalibration::OfflineReference
+        } else {
+            PredictionCalibration::Uncalibrated
+        },
         model_id: action.model_id.clone(),
         device: action.device.clone(),
         inference_cost_seconds: Seconds::new(0.0).ok_or(PredictError::InvalidOutput)?,
@@ -144,101 +150,10 @@ impl Predictor for EmaPredictor {
     }
 }
 
-/// Deterministic 100k-parameter CPU MLP alternative for the configurable
-/// CostAware pilot. The input signal is replicated across 64 features because
-/// the matrix arm exposes one scalar observed signal at each tick.
-pub struct Mlp100kPredictor {
-    first: Vec<f32>,
-    first_bias: Vec<f32>,
-    second: Vec<f32>,
-    second_bias: Vec<f32>,
-    output: Vec<f32>,
-    output_bias: Vec<f32>,
-}
-
-impl Mlp100kPredictor {
-    pub fn new() -> Self {
-        const INPUTS: usize = 64;
-        const HIDDEN: usize = 283;
-        const OUTPUTS: usize = 4;
-        let mut state = 0xC0A5_AE10_0BEE_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state as u32) as f32 / u32::MAX as f32 - 0.5) * 0.02
-        };
-        let mut weights = |count| (0..count).map(|_| next()).collect();
-        Self {
-            first: weights(INPUTS * HIDDEN),
-            first_bias: weights(HIDDEN),
-            second: weights(HIDDEN * HIDDEN),
-            second_bias: weights(HIDDEN),
-            output: weights(HIDDEN * OUTPUTS),
-            output_bias: weights(OUTPUTS),
-        }
-    }
-}
-
-impl Default for Mlp100kPredictor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Predictor for Mlp100kPredictor {
-    fn predict(
-        &self,
-        window: &ObservationWindow,
-        action: &MetaAction,
-    ) -> Result<Prediction, PredictError> {
-        const INPUTS: usize = 64;
-        const HIDDEN: usize = 283;
-        const OUTPUTS: usize = 4;
-        let start = Instant::now();
-        let observation = window
-            .latest(&action.target)
-            .filter(|o| o.source == Source::Observed)
-            .ok_or(PredictError::NoObservation)?;
-        let input = observation.value as f32;
-        let mut hidden = vec![0.0; HIDDEN];
-        for (row, value) in hidden.iter_mut().enumerate() {
-            let offset = row * INPUTS;
-            let sum = self.first[offset..offset + INPUTS]
-                .iter()
-                .map(|weight| *weight * input)
-                .sum::<f32>()
-                + self.first_bias[row];
-            *value = sum.max(0.0);
-        }
-        let mut second = vec![0.0; HIDDEN];
-        for (row, value) in second.iter_mut().enumerate() {
-            let offset = row * HIDDEN;
-            let sum = self.second[offset..offset + HIDDEN]
-                .iter()
-                .zip(&hidden)
-                .map(|(weight, input)| *weight * input)
-                .sum::<f32>()
-                + self.second_bias[row];
-            *value = sum.max(0.0);
-        }
-        let mut output = [0.0; OUTPUTS];
-        for (row, value) in output.iter_mut().enumerate() {
-            let offset = row * HIDDEN;
-            *value = self.output[offset..offset + HIDDEN]
-                .iter()
-                .zip(&second)
-                .map(|(weight, input)| *weight * input)
-                .sum::<f32>()
-                + self.output_bias[row];
-        }
-        let value = f64::from(output[0]).clamp(0.0, 1.0);
-        set_inference_cost(
-            start,
-            prediction(value, observation, action, 0.25, Source::Predicted)?,
-        )
-    }
-}
+/// Explicit opt-in for observed-only predictors. OraclePredictor does not implement it.
+pub trait OnlinePredictor: Predictor {}
+impl OnlinePredictor for LastValuePredictor {}
+impl OnlinePredictor for EmaPredictor {}
 
 #[derive(Clone, Debug)]
 pub struct OraclePredictor {
@@ -270,9 +185,6 @@ impl OraclePredictor {
     }
 }
 impl Predictor for OraclePredictor {
-    fn oracle_only(&self) -> bool {
-        true
-    }
     fn predict(
         &self,
         window: &ObservationWindow,
@@ -297,34 +209,211 @@ impl Predictor for OraclePredictor {
         )
     }
 }
-/// Measures actual synchronous inference wall time and rejects results that miss the requested budget.
-pub fn predict_with_budget(
-    predictor: &dyn Predictor,
-    window: &ObservationWindow,
-    action: &MetaAction,
-) -> Result<Prediction, PredictError> {
-    if !predictor.oracle_only()
-        && window
+
+struct PredictionRequest {
+    generation: u64,
+    window: ObservationWindow,
+    action: MetaAction,
+}
+
+struct WorkerResult {
+    generation: u64,
+    completed: Instant,
+    worker_wall_ns: u64,
+    result: Result<Prediction, PredictError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerCompletion {
+    pub generation: u64,
+    pub worker_wall_ns: u64,
+    pub dropped_late_result: bool,
+}
+
+pub struct PredictionAttempt {
+    pub invocations: u8,
+    pub wall_ns: u64,
+    pub completion: Option<WorkerCompletion>,
+    pub result: Result<Prediction, PredictError>,
+}
+
+/// Single-worker executor. A timeout abandons the result and retains the slot
+/// until completion. Dropping the controller disconnects the worker, without
+/// joining or claiming to cancel an operation already running.
+pub struct PredictionExecutor {
+    requests: SyncSender<PredictionRequest>,
+    results: Receiver<WorkerResult>,
+    in_flight: Option<u64>,
+    generation: u64,
+}
+
+fn wall_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+impl PredictionExecutor {
+    /// Oracle cannot be installed in an online executor.
+    ///
+    /// ```compile_fail
+    /// use harm::predict::{OraclePredictor, PredictionExecutor};
+    /// fn leak(trace: OraclePredictor) {
+    ///     let _ = PredictionExecutor::start(trace);
+    /// }
+    /// ```
+    pub fn start(predictor: impl OnlinePredictor + 'static) -> std::io::Result<Self> {
+        let (requests, receive) = mpsc::sync_channel::<PredictionRequest>(1);
+        let (send, results) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("harm-online-predict".into())
+            .spawn(move || {
+                while let Ok(job) = receive.recv() {
+                    let start = Instant::now();
+                    let result =
+                        predictor
+                            .predict(&job.window, &job.action)
+                            .and_then(|prediction| {
+                                if prediction.source != Source::Predicted {
+                                    Err(PredictError::InvalidOutput)
+                                } else {
+                                    Ok(prediction)
+                                }
+                            });
+                    let completed = Instant::now();
+                    if send
+                        .send(WorkerResult {
+                            generation: job.generation,
+                            completed,
+                            worker_wall_ns: wall_ns(completed.duration_since(start)),
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests,
+            results,
+            in_flight: None,
+            generation: 0,
+        })
+    }
+
+    pub fn in_flight_generation(&self) -> Option<u64> {
+        self.in_flight
+    }
+
+    /// Called between ticks to collect the cost of work abandoned by a timeout.
+    /// The prediction payload is deliberately inaccessible here.
+    pub fn reap_late(&mut self) -> Option<WorkerCompletion> {
+        let done = match self.results.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = None;
+                return None;
+            }
+        };
+        debug_assert_eq!(self.in_flight, Some(done.generation));
+        self.in_flight = None;
+        Some(Self::completion(&done, true))
+    }
+
+    fn completion(done: &WorkerResult, dropped_late_result: bool) -> WorkerCompletion {
+        WorkerCompletion {
+            generation: done.generation,
+            worker_wall_ns: done.worker_wall_ns,
+            dropped_late_result,
+        }
+    }
+
+    fn timeout(waited: Duration) -> PredictError {
+        PredictError::Timeout {
+            elapsed: Seconds::new(waited.as_secs_f64()).expect("duration"),
+        }
+    }
+
+    pub fn attempt(
+        &mut self,
+        window: &ObservationWindow,
+        action: &MetaAction,
+        tick_deadline: Instant,
+    ) -> PredictionAttempt {
+        let start = Instant::now();
+        let refused = |error| PredictionAttempt {
+            invocations: 0,
+            wall_ns: 0,
+            completion: None,
+            result: Err(error),
+        };
+        if self.in_flight.is_some() {
+            return refused(PredictError::Busy);
+        }
+        if window
             .observations
             .iter()
-            .any(|observation| observation.source.is_oracle())
-    {
-        return Err(PredictError::InvalidTrace(
-            "oracle observations are restricted to oracle predictors".into(),
-        ));
+            .any(|o| o.source != Source::Observed)
+        {
+            return refused(PredictError::InvalidTrace(
+                "online input requires observed samples".into(),
+            ));
+        }
+        let deadline = match Duration::try_from_secs_f64(action.budget.get())
+            .ok()
+            .and_then(|budget| start.checked_add(budget))
+        {
+            Some(deadline) => deadline.min(tick_deadline),
+            None => return refused(PredictError::InvalidOutput),
+        };
+        let generation = self.generation.wrapping_add(1);
+        let request = PredictionRequest {
+            generation,
+            action: action.clone(),
+            window: window.clone(),
+        };
+        if Instant::now() >= deadline {
+            return refused(Self::timeout(start.elapsed()));
+        }
+        if self.requests.try_send(request).is_err() {
+            return refused(PredictError::WorkerUnavailable);
+        }
+        self.generation = generation;
+        self.in_flight = Some(generation);
+        let result = self
+            .results
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let returned = Instant::now();
+        let waited = returned.duration_since(start);
+        let mut completion = None;
+        let result = match result {
+            Ok(done) => {
+                self.in_flight = None;
+                let late = done.generation != generation
+                    || done.completed >= deadline
+                    || returned >= deadline;
+                completion = Some(Self::completion(&done, late));
+                if late {
+                    Err(Self::timeout(waited))
+                } else {
+                    done.result
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(Self::timeout(waited)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.in_flight = None;
+                Err(PredictError::WorkerUnavailable)
+            }
+        };
+        PredictionAttempt {
+            invocations: 1,
+            wall_ns: wall_ns(waited),
+            completion,
+            result,
+        }
     }
-    let start = Instant::now();
-    let mut result = predictor.predict(window, action)?;
-    let elapsed = start.elapsed();
-    let elapsed_seconds = Seconds::new(elapsed.as_secs_f64()).ok_or(PredictError::InvalidOutput)?;
-    if elapsed_seconds.get() > action.budget.get() {
-        return Err(PredictError::Timeout {
-            elapsed: elapsed_seconds,
-        });
-    }
-    result.inference_cost_seconds = elapsed_seconds;
-    Ok(result)
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FallbackDecision {
     Use(Prediction),
@@ -375,25 +464,8 @@ mod tests {
             .unwrap();
         assert_eq!(ema.predicted_value, 12.5);
     }
-    struct Slow;
-    impl Predictor for Slow {
-        fn predict(
-            &self,
-            w: &ObservationWindow,
-            a: &MetaAction,
-        ) -> Result<Prediction, PredictError> {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            LastValuePredictor.predict(w, a)
-        }
-    }
     #[test]
-    fn timeout_is_reported_and_fallback_uses_last_valid_or_skip() {
-        let mut short = action();
-        short.budget = Seconds::new(0.001).unwrap();
-        assert!(matches!(
-            predict_with_budget(&Slow, &window(), &short),
-            Err(PredictError::Timeout { .. })
-        ));
+    fn fallback_uses_last_valid_or_skip() {
         let valid = LastValuePredictor.predict(&window(), &action()).unwrap();
         assert!(matches!(
             fallback(std::slice::from_ref(&valid), 4.0),
@@ -419,12 +491,102 @@ mod tests {
     #[test]
     fn production_predictor_refuses_oracle_observations() {
         let mut window = window();
+        let mut executor = PredictionExecutor::start(LastValuePredictor).unwrap();
         for source in [Source::Oracle, Source::StudyOracle] {
             window.observations[2].source = source;
             assert!(matches!(
-                predict_with_budget(&LastValuePredictor, &window, &action()),
+                executor
+                    .attempt(&window, &action(), Instant::now() + Duration::from_secs(1))
+                    .result,
                 Err(PredictError::InvalidTrace(_))
             ));
         }
+    }
+
+    struct BlockingPredictor {
+        calls: std::sync::atomic::AtomicUsize,
+        started: SyncSender<usize>,
+        unblock_first: std::sync::Mutex<Receiver<()>>,
+    }
+    impl OnlinePredictor for BlockingPredictor {}
+    impl Predictor for BlockingPredictor {
+        fn predict(
+            &self,
+            window: &ObservationWindow,
+            action: &MetaAction,
+        ) -> Result<Prediction, PredictError> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.started.send(call).unwrap();
+            if call == 0 {
+                self.unblock_first.lock().unwrap().recv().unwrap();
+            }
+            LastValuePredictor.predict(window, action)
+        }
+    }
+
+    #[test]
+    fn hard_budget_returns_while_worker_blocks_and_discards_late_generation() {
+        let (started, calls) = mpsc::sync_channel(2);
+        let (release, unblock_first) = mpsc::channel();
+        let (timed_out, caller_result) = mpsc::sync_channel(1);
+        let watchdog = Duration::from_secs(2);
+        let mut executor = PredictionExecutor::start(BlockingPredictor {
+            calls: Default::default(),
+            started,
+            unblock_first: std::sync::Mutex::new(unblock_first),
+        })
+        .unwrap();
+        // Keep the predictor blocked until the caller has already returned.
+        // This tests independence from completion without a fragile timing
+        // comparison at the scheduler's millisecond boundary.
+        let controller = thread::spawn(move || {
+            let mut action = action();
+            action.budget = Seconds::new(0.025).unwrap();
+            let attempt = executor.attempt(&window(), &action, Instant::now() + watchdog);
+            timed_out.send((executor, attempt)).unwrap();
+        });
+        assert_eq!(calls.recv_timeout(watchdog).unwrap(), 0);
+        let (mut executor, attempt) = caller_result.recv_timeout(watchdog).unwrap();
+        assert!(matches!(attempt.result, Err(PredictError::Timeout { .. })));
+        assert_eq!(attempt.invocations, 1);
+        assert_eq!(executor.in_flight_generation(), Some(1));
+        for _ in 0..128 {
+            let repeated = executor.attempt(&window(), &action(), Instant::now() + watchdog);
+            assert_eq!(repeated.result, Err(PredictError::Busy));
+            assert_eq!(repeated.invocations, 0);
+        }
+        assert!(calls.try_recv().is_err());
+        release.send(()).unwrap();
+        let limit = Instant::now() + watchdog;
+        let completion = loop {
+            if let Some(completion) = executor.reap_late() {
+                break completion;
+            }
+            assert!(Instant::now() < limit);
+            thread::yield_now();
+        };
+        assert_eq!(completion.generation, 1);
+        assert!(completion.dropped_late_result);
+        assert_eq!(executor.in_flight_generation(), None);
+
+        let mut fresh = window();
+        fresh.observations.last_mut().unwrap().value = 34.0;
+        let next = executor.attempt(&fresh, &action(), Instant::now() + watchdog);
+        assert_eq!(calls.recv_timeout(watchdog).unwrap(), 1);
+        assert_eq!(next.completion.unwrap().generation, 2);
+        assert_eq!(next.result.unwrap().predicted_value, 34.0);
+        assert!(calls.try_recv().is_err());
+        controller.join().unwrap();
+    }
+
+    #[test]
+    fn hard_budget_checks_tick_deadline_before_submission() {
+        let mut executor = PredictionExecutor::start(LastValuePredictor).unwrap();
+        let result = executor.attempt(&window(), &action(), Instant::now());
+        assert!(matches!(result.result, Err(PredictError::Timeout { .. })));
+        assert_eq!(result.invocations, 0);
+        assert_eq!(executor.in_flight_generation(), None);
     }
 }

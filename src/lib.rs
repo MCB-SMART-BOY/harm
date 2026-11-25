@@ -83,6 +83,13 @@ pub struct RunMetadata {
     pub gpu_driver: Metric<String>,
     pub capabilities: Vec<String>,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PredictionCalibration {
+    #[default]
+    Uncalibrated,
+    OfflineReference,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Prediction {
     pub target: String,
@@ -90,6 +97,8 @@ pub struct Prediction {
     pub observed_at_seconds: f64,
     pub horizon_seconds: f64,
     pub uncertainty: Ratio,
+    #[serde(default)]
+    pub calibration: PredictionCalibration,
     pub model_id: String,
     pub device: String,
     pub inference_cost_seconds: Seconds,
@@ -232,6 +241,7 @@ fn expired_prediction_rejected() {
         predicted_value: 0.0,
         observed_at_seconds: 1.0,
         horizon_seconds: 1.0,
+        calibration: PredictionCalibration::Uncalibrated,
         uncertainty: Ratio::new(0.1).unwrap(),
         model_id: "ema".into(),
         device: "cpu".into(),
@@ -251,6 +261,7 @@ fn oracle_predictions_cannot_enter_production() {
         predicted_value: 0.0,
         observed_at_seconds: 1.0,
         horizon_seconds: 1.0,
+        calibration: PredictionCalibration::Uncalibrated,
         uncertainty: Ratio::new(0.1).unwrap(),
         model_id: "trace".into(),
         device: "offline".into(),
