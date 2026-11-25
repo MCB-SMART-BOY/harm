@@ -25,3 +25,12 @@ Primary analysis is lexicographic: satisfy the pre-registered SLO and safety con
 `V(m,d|S) = E[J(a_0,S') - J(a_{m,d},S') | S] - C_infer(m,d,S) - C_wake(d,S) - C_observe(S) - C_actuate(a)` where `a_0` is the best no-new-prediction action and `a_{m,d}` uses model `m` on device `d`. Predict only if conservative lower confidence bound of `V` is positive and the prediction will still be valid at action time. **No double counting:** each elapsed joule/CPU time/latency cost is charged to exactly one cost term; inference cost excludes GPU wake and collection cost; objective penalties exclude controller overhead if overhead is separately subtracted. Compare against a matched no-prediction counterfactual.
 
 This document is a protocol, not a result. No experiment result or innovation claim is made.
+
+The W1 A7 feasibility policy instantiates the research objective with a
+background deadline-risk constraint and foreground-violation equivalents
+for overhead. It uses a structural upper bound before acquiring a forecast
+and evaluates modeled utility after acquisition. A7 requires an independent
+calibration for the service costs. EMA uncertainty remains uncalibrated.
+Historical H3 reports acceptance after an inference call and supplies
+descriptive service evidence. A matched always-predict comparison is still
+required for a causal acquisition result. [A7 and the validity audit](VALIDITY-AUDIT.md)

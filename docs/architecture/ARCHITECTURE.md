@@ -11,9 +11,9 @@ One `harm` package contains `predict`, `telemetry`, `control`, `bench`, and `stu
 | 0 Hardware/kernel | P/E cores, GPU node, `/proc`, PSI, cgroup v2 | Linux interfaces |
 | 1 Observation | live state, bounded in-memory retention, optional GPU query | `sample_with_gpu_probe`, `telemetry::BoundedRing`, `telemetry::probe_gpu` |
 | 2 Domain/provenance | availability, units, source | `Metric<T>`, `Seconds`, `Ratio`, `Source`, `Sample` |
-| 3 Prediction | LastValue/EMA, offline trace oracle, inference timing, expiry/fallback | `predict::{Predictor,LastValuePredictor,EmaPredictor,OraclePredictor,predict_with_budget,fallback}` |
+| 3 Prediction | LastValue/EMA, offline trace oracle, single-slot executor, expiry/fallback | `predict::{Predictor,OnlinePredictor,EmaPredictor,OraclePredictor,PredictionExecutor,fallback}` |
 | 4 Control | identical observation/action contract, validation, cgroup v2 weight safety | `control::{Controller,NativeController,StaticController,ReactiveController,OracleController,FuturePhaseController,WeightController,DelegatedScope}` |
-| 5 Meta-decision | skip/predict, model/device/budget/horizon selection | research question; not learned or implemented |
+| 5 Meta-decision | A7 acquisition gate and constrained utility for the EMA feasibility policy | `study::cost_aware::{ObservedDecisionInput,CostAwareState,DecisionUtility}` |
 | 6 Workload/recording | CPU phase workers, ping-pong latency, JSONL/audit | `bench`, `metadata`, `write_jsonl`, `main.rs` |
 | Study configuration | versioned inputs, validation, workload schedule and arm order | `study/config.rs` |
 | Study execution | delegated trial launch, observations, audits and summary recording | `study/runner.rs` |

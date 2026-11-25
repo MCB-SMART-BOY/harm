@@ -274,3 +274,96 @@ retain right-censoring at the deadline, and keep the paired block as the
 experimental unit. The feasibility precondition, margins, bootstrap
 procedure, and dominance direction must be fixed before inspecting
 follow-on efficacy results.
+
+**A7, 2026-11-25 (Asia/Shanghai), before collecting any repaired CostAware
+outcome.** Historical H3 acceptances and service counts remain descriptive.
+The old cost path read future protected intervals and compared event counts
+with a time ratio. H3 cannot establish acquisition savings or net benefit.
+
+The `a7_pilot` stage covers W1 feasibility and its separate Oracle
+reference. Derive a new configuration from `configs/matrix-h3-pilot.json`
+by setting `matrix.stage` to `a7_pilot`, removing
+`matrix.cost_aware.marginal_background_delay_per_protected_second`, and
+adding `matrix.cost_aware.service_calibration` with the fields below. Freeze
+the configuration, calibration version, and independent evidence identifier
+before collecting outcomes. Historical data are insufficient to calibrate
+these parameters. The runner requires their explicit values.
+The feasibility stage preserves the A5 trial-level service scoring.
+
+The online input uses a trailing 200 ms window of published W1 completions
+through the actual monotonic observation cutoff. It receives no phase label,
+phase age, phase boundaries, trial-relative timestamp, or reference trace.
+Reactive fallback and the A7 Reactive comparator use the same phase-blind
+rolling p90 rule. Oracle consumes its separate reference trace and emits
+`StudyOracle` proposals. Offline attribution and scoring retain the raw
+stream and phase records.
+
+For horizon `H = 0.5 s`, project `E = n H / 0.2 s` opportunities from
+`n` completions. Let `p` be the EMA (`α = 0.5`, up to four consecutive
+available ticks) of the observed fraction of latencies above the W1 SLO
+threshold. The model uses `p` as a proxy for per-opportunity violation
+probability under fallback. Its samples reflect the weights actually in
+effect, and the fallback-risk interpretation has no independent validation.
+The EMA residual is logged as uncalibrated
+uncertainty and carries no confidence level. Let `r` be the independently
+calibrated `foreground_risk_reduction_fraction` for replacing the fallback
+with protection. The projected foreground counts are `F₀ = E p` and
+`F₁ = F₀ (1 − r)`. The modeled benefit `F₀ − F₁` is in expected
+foreground violations over `H`.
+
+Apply the background constraint separately on the probability scale.
+Use `B₀ = background_baseline_miss_probability` for the chance the
+background job misses its deadline during `H` under fallback and
+`B₁ = min(1, B₀ + b × D)` under protection. Here `b` is
+`background_marginal_miss_probability_per_action_second` and `D` is
+`action_duration_secs = 0.05 s`, one tick of intended protection. Estimate
+these risks from independent calibration for the registered horizon,
+action, and workload. `max_background_miss_probability` is the
+preregistered limit for a predicted override. The model uses only `D`
+and the fixed marginal cost. Verified readback times track the actual
+duration of each weight, including persistence when reversion is delayed.
+
+Convert overhead to `CalibratedLoss` in foreground-violation equivalents
+using `C = k × (T_obs + T_predict + T_apply)`.
+`violation_equivalents_per_overhead_second` is `k`. It requires independent
+evidence of the service loss induced by extra controller occupancy.
+`T_obs` is the measured current observation time. `T_predict` is measured
+caller prediction elapsed time including transport and wait. `T_apply` uses
+`actuation_seconds`, the frozen independent actuation charge based on
+actuator-entry-through-verified-readback measurements. The existing audit
+retains live actuation timestamps. Record `version` and `evidence` for the
+full service calibration. Report observed service and all cost components
+individually. Do not add worker runtime to caller wait as a second elapsed
+charge, or subtract measured service loss twice.
+
+Before invocation, `E r` is a structural upper bound on the gain in this
+model (`p ≤ 1`). Skip acquisition when `E r ≤ k × (T_obs + T_apply)`,
+when the background constraint fails, or when fallback already requests
+protection. The lower bound on the predictor term is zero. An incomplete,
+empty, or overflowed observation window yields `Unavailable`. Skip
+acquisition while a previous timed-out prediction still occupies the
+worker slot or the tick has expired. Otherwise invoke EMA once. Accept a
+fresh result only if `B₁ ≤ max_background_miss_probability` and
+`(F₀ − F₁) − C > 0`. Fall back to the Reactive proposal if the required
+input or result is unavailable, timed out, expired, or has nonpositive
+utility. The action remains subject to the verified actuator and tick
+expiry.
+
+Audit `skip-before-predict` with zero invocations and zero predictor wall
+time, `reject-prediction` after an invocation that does not supply a
+usable override, and `accept-prediction` for an accepted override.
+Invocation totals, proposed weights, and readbacks are separate counts.
+Apply the 2 ms predictor budget capped by the remaining tick. At most one
+generation occupies the worker. A timeout returns to fallback without
+waiting for completion. Audit completed worker wall time and the subset
+spent on late drops separately from caller latency. An unfinished
+generation at trial end is explicit and its final cost is `Unavailable`.
+The live ring capacity is 65,536 events. Capacity evictions are audited
+and raw evidence is retained.
+
+A causal acquisition or net-benefit claim requires a paired,
+preregistered comparison to the same predictor always invoked, calibrated
+service-loss units, measured overhead and verified lead time where relevant,
+and phase onsets unavailable to the online policies. This amendment
+registers feasibility and the decision formula. Accuracy and efficacy
+estimates require new measurements.

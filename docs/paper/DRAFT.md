@@ -4,9 +4,9 @@
 
 We measure the value and cost of predicting when to protect a latency-sensitive foreground task from competing CPU work on a heterogeneous Linux desktop. In 42 matched interactive blocks, trace-driven Oracle and Static-low each passed both latency thresholds in 42/42 blocks. Oracle met 28/42 CPU deadlines versus Static-low’s 8/42, a joint gain of 47.62 percentage points (95% CI [30.95, 64.29]). Native passed 14/42 burst and 7/42 spike latency thresholds. Oracle cut mean spike p99 by 2.157 ms (95% CI [1.844, 2.438]), but missed more CPU deadlines than Native and failed the preregistered joint-service gate.[^w1]
 
-CPU predictor costs ranged from about 2 µs for EMA and a 10k-parameter model to 1.9 ms for a 4M model. The 4M paths consumed 1.25–3.8% of a 50 ms tick. Measured inference fit comfortably within that budget. GPU beat four-thread CPU only at warm 4M p50 and incurred about 1 ms extra at p50 after queue idle.[^cost][^h3]
+CPU execution ranged from about 2 µs for the historical EMA call and the synthetic 10k-parameter MLP to 1.9 ms for the synthetic 4M MLP. The 4M paths consumed 1.25–3.8% of a 50 ms tick. Measured inference fit comfortably within that budget. GPU beat four-thread CPU only at warm 4M p50 and incurred about 1 ms extra at p50 after queue idle.[^cost][^h3]
 
-In a separate feasibility pilot, observed-signal CostAware chose `predict` on 884/1,440 ticks and achieved 0/6 latency and 0/6 joint passes. We interpret that result as a lack of useful forecasting lead time in this policy.[^h3]
+In a historical feasibility pilot, CostAware accepted 884 predictions after invocation across 1,440 ticks and achieved 0/6 latency and 0/6 joint passes. The pilot supplies descriptive service outcomes. Its design cannot establish acquisition savings, net benefit, or the cause of the service gap.[^h3]
 
 ## 1. Introduction
 
@@ -17,8 +17,8 @@ Prior work accounts for the cost of prediction in queueing policies and for the 
 We make three contributions.
 
 1. **A measured service tradeoff for advance control.** On this host, Oracle preserved Static-low’s 42/42 passes on each protected phase and increased CPU deadline passes from 8/42 to 28/42. The paired joint gain was 47.62 percentage points (95% CI [30.95, 64.29]). The mean spike p99 reduction versus Native was 2.157 ms (95% CI [1.844, 2.438]). Native retained more CPU deadline passes and the original H1 gate failed.[^w1]
-2. **Measured predictor costs at controller scale.** Warm batch-one CPU inference ranged from roughly 2 µs at 10k to 1.9 ms at 4M. At 4M, the measured paths occupied 1.25–3.8% of the tick using worst-run p99. GPU’s sole warm advantage over four-thread CPU in the reported quantiles was 4M p50, and the first call after queue idle had about 1 ms of additional median latency.[^cost]
-3. **A feasibility result for an observed-signal cost-aware policy.** The EMA-based controller logged 884/1,440 positive decisions and still had 0/6 latency and 0/6 joint passes. Its service resembled Reactive on the latency axis and was weaker on the deadline axis. We interpret this as evidence that this estimator supplied no useful advance warning under the tested calibration.[^h3]
+2. **Measured synthetic MLP compute costs at controller scale.** Warm batch-one CPU inference ranged from roughly 2 µs at 10k to 1.9 ms at 4M. At 4M, the measured paths occupied 1.25–3.8% of the tick using worst-run p99. GPU’s sole warm advantage over four-thread CPU in the reported quantiles was 4M p50, and the first call after queue idle had about 1 ms of additional median latency.[^cost]
+3. **Historical feasibility measurements for an EMA-based policy.** The controller accepted 884 predictions after invocation across 1,440 ticks and had 0/6 latency and 0/6 joint passes. It tied Reactive on the latency pass count and had fewer deadline passes. The pilot leaves the cause of that gap unresolved.[^h3]
 
 ## 2. Related work
 
@@ -42,7 +42,7 @@ Each trial runs in a fresh rootless `systemd-run --user --scope -p Delegate=yes`
 - **Static-low** holds the workload at weight 20 after its initial apply. **Static-high** holds it at 1,000.
 - **Reactive** selects the same low/high weights using recent observations and retains its previous choice when the signal is unavailable.
 - **Oracle** reads only phase boundaries from a separate, hashed reference trace of the same class and seed. It requests low weight during protected phases and in the configured lookahead before each one, and high weight otherwise. The actuator admits `StudyOracle` only in study mode. The reference policy knows the future phase timeline. It has no oracle for individual request latency or CPU completion.
-- **CostAware** smooths recent observed risk signals on CPU and compares an estimated benefit with an estimated cost. A positive decision requests protection. Other decisions fall back to Reactive, and the actuator still enforces expiry and verifies any actual change. Prediction inputs require `Observed` provenance. The estimator also uses the shared phase configuration to price protected time and a fixed calibration coefficient to price background delay. The cost model’s assumptions, observed events, predicted values, and study-only future trace have distinct provenance.[^design][^h3]
+- **Historical CostAware** smoothed observed signals on CPU and invoked EMA before testing whether to accept its output. Acceptance requested protection, with Reactive as fallback. Its cost calculation read future protected intervals from the shared phase schedule and compared a time ratio with an expected count. A7 defines a phase-blind acquisition gate and a versioned service-loss objective for future trials.[^design][^h3]
 
 ### Registration and audit trail
 
@@ -89,11 +89,11 @@ The sweep timed synchronous batch-one dense inference on real hardware with synt
 | 1M | 432.90 / 436.05 / 437.09 | 125.89 / 131.97 / 139.09 | 307.18 / 886.33 / 1,109.66 |
 | 4M | 1,875.82 / 1,880.61 / 1,892.83 | 488.93 / 493.94 / 498.61 | 467.60 / 1,221.89 / 1,460.75 |
 
-The GPU first beat CPU/1 on warm p50 at 1M and beat CPU/4 only at 4M p50 across these reported warm quantiles. Its first inference after benchmark-queue idle added about 1 ms at p50 compared with warm. The GPU remained runtime-active, so the difference measures the post-idle path of this queue on the shared host. At 4M, the largest run-level p99 across repetitions used 3.787% of a 50 ms tick on CPU/1, 1.252% on CPU/4, 2.951% on warm GPU, and 3.784% after GPU queue idle. The pilot EMA call averaged 2.156 µs.[^cost][^h3]
+The GPU first beat CPU/1 on warm p50 at 1M and beat CPU/4 only at 4M p50 across these reported warm quantiles. Its first inference after benchmark-queue idle added about 1 ms at p50 compared with warm. The GPU remained runtime-active, so the difference measures the post-idle path of this queue on the shared host. At 4M, the largest run-level p99 across repetitions used 3.787% of a 50 ms tick on CPU/1, 1.252% on CPU/4, 2.951% on warm GPU, and 3.784% after GPU queue idle. The pilot EMA call averaged 2.156 µs. The random-weight MLP measures compute costs and CPU/GPU numerical agreement. Forecast accuracy was unavailable.[^cost][^h3]
 
 At these scales, measured standalone predictor latency left most of the control tick available. Useful lead time can be shorter than a tick, and the foreground has a separate, tighter service deadline. Controller work, observation age, actuation and contention still consume some of that time. The W1 service measurements already include in-trial interference. Adding timed prediction to active tick compute, or adding apply-to-readback again to decision-to-readback, would double-count overlapping intervals.[^cost][^w1]
 
-### 5.3 Positive cost-aware decisions did not improve pilot service
+### 5.3 Historical CostAware service and acceptance counts
 
 **Table 3. W1 feasibility pilot service by arm.** Latency pass requires both protected phases to pass. “Unavailable” denotes an arm with no prediction measurement.[^h3]
 
@@ -104,18 +104,18 @@ At these scales, measured standalone predictor latency left most of the control 
 | Oracle | 6/6 | 5/6 | 5/6 | 0.305 µs (lookup) |
 | CostAware | 0/6 | 4/6 | 0/6 | 2.156 µs (EMA) |
 
-The pilot estimates a baseline risk count from recent observed violations and opportunities, discounts it using the EMA output and uncertainty, and compares it with an inference and background-delay estimate. These are heuristic bounds. The controller computes predictions when it has suitable inputs and then decides whether to use the result. A `skip` may already have paid inference cost. A positive `predict` may request a weight already in effect. The label therefore measures policy decisions separately from calls and verified writes.[^h3] [CostAware implementation](../../src/study/matrix/control.rs)
+The historical controller invoked EMA on 1,428 ticks. It compared a heuristic expected violation count with a time ratio priced using future phase boundaries. The `predict` and `skip` labels describe acceptance and fallback, and either could follow a call. An accepted forecast could request a weight already in effect. Count predictor calls and verified writes independently of these labels.[^h3]
 
-The controller recorded 884 positive `predict` and 556 `skip` decisions over 1,440 ticks. CostAware tied Reactive on latency and joint passes with fewer CPU deadline passes. It also spent more per call than the in-memory Oracle lookup. Native’s remaining trials were backfilled with the same binary and configuration, so ordering differs from the other arms. The pilot supports feasibility and descriptive outcomes. It provides no inferential estimate of efficacy or non-inferiority.[^h3]
+The controller recorded 884 positive `predict` and 556 `skip` decisions over 1,440 ticks. CostAware tied Reactive on latency and joint passes with fewer CPU deadline passes. It also spent more per call than the in-memory Oracle lookup. Native’s remaining trials were backfilled with the same binary and configuration, so ordering differs from the other arms. Treat the pilot as descriptive archival evidence. The design cannot identify acquisition value, calibrated net benefit, efficacy, or non-inferiority.[^h3]
 
-The observed risk signal responds to contention that has already appeared. The positive decisions produced no protected latency pass despite cheap inference. Oracle’s result shows what verified pre-onset changes can achieve with the recorded schedule. Together these observations suggest that this CostAware policy behaved like feedback at the service level because its signal supplied no demonstrated actionable lead. The pilot cannot separate that explanation from estimator calibration, the weight-choice rule, or trial order.[^h3][^w1]
+The risk signal responded to observed contention. Oracle shows what verified pre-onset changes achieved with the recorded schedule. The historical pilot leaves open whether lead time, estimator calibration, the weight-choice rule, or trial order explains the service gap.[^h3][^w1]
 
 ## 6. Limitations and threats to validity
 
 - **Host and workload scope.** The study covers one host with a resident-idle 94.58 GB LLM and one scored workload class, an interactive proxy competing with fixed CPU work. Memory pressure and swap could vary even with the LLM idle. An active LLM, different topology or kernel, or another foreground duty cycle could change the service tradeoff.[^w1]
 - **Calibration and attribution.** A2 sized work so the CPU deadline would bind under the low-weight baseline. A4 reserved CPU capacity for control. The workload has explicit protected phases, and the Oracle used their recorded schedule. Results are conditional on these choices. Censored completion times limit what the continuous background endpoint can say. The design tests a particular Oracle schedule and actuator, with other feasible schedules left unmeasured.[^design][^w1]
 - **Accelerator scope.** W2–W4 were held and provide no scored workload evidence. The standalone inference sweep used synthetic inputs, a particular dense model and CPU parallelization strategy, one accelerator and driver, and batch-one execution. It verifies queue idle, with whole-device engine idle unverified during those intervals. Whole-machine energy remained unavailable.[^hold][^cost][^w1]
-- **The CostAware comparison.** A small feasibility pilot without a matched lead-time ablation cannot establish why the policy failed. Fixed phase timing could also make a clock-only policy appear predictive. A follow-on needs phase onsets that a policy cannot recover from the trial clock alone.[^h3]
+- **The CostAware comparison.** A causal claim requires the A7 repair, independently calibrated service-loss units, and a matched always-predict control. Identifying an effect of usable lead time also requires a matched lead-time ablation and phase onsets unavailable from the trial clock.[^h3] [Validity audit](../research/VALIDITY-AUDIT.md)
 - **Public artifact coverage.** The committed inference sample carries all run summaries needed for Table 2. The scored W1 and H3 reports commit the aggregate results. Trial-level recomputation of those reports requires the retained local archives. The Phase 3 sample traces show schema and provenance and cannot substitute for either archive.[^w1][^cost][^h3]
 
 ## 7. Discussion
@@ -177,7 +177,7 @@ bun experiments/predictor-cost-analysis.ts "$run_cost/full.jsonl" --trim \
   > "$run_cost/sample.jsonl"
 ```
 
-This H3 command runs one pilot trial. The source report records the arm list, seeds, and Native backfill order. For the Oracle arm, supply the corresponding Native reference traces.[^h3]
+The following archival command used revision `b76b950` to collect one H3 trial. A7 rejects the historical configuration. The source report records the arm list, seeds, and Native backfill order.[^h3]
 
 ```sh
 run_h3=$(mktemp -d)
@@ -254,7 +254,7 @@ git diff --check
     rg '^\| (Native|Reactive|Oracle|CostAware|\*\*Pooled\*\*) ' docs/research/H3-PILOT.md
     ```
 
-    Validate the accepted verdicts and recompute service and predictor costs from the retained archive. The second command counts ticks and verifies the positive decision predicate using only CostAware-trial files.
+    Validate the accepted verdicts and recompute service and predictor costs from the retained archive. The second command checks the historical acceptance predicate in CostAware-trial files. It verifies archival consistency.
 
     ```sh
     h3=/tmp/harm-h3-pilot-20261125-run1/feasibility-h3-w1
@@ -313,4 +313,4 @@ git diff --check
 - **Held classes.** W2–W4 failed the pilot headroom rule. Their GPU or CPU results remain feasibility evidence.[^hold]
 - **Scored H1.** First-phase validity passed after A4. The scored joint-service gate failed, and Oracle’s CPU miss rate was higher than Native’s.[^w1]
 - **Accelerator inference.** The tested GPU path had no warm p95 or p99 advantage over CPU/4 and incurred a post-idle latency penalty. The data leave device resume and whole-machine energy unmeasured.[^cost]
-- **Observed-signal CostAware.** Positive decisions were frequent, yet the policy achieved 0/6 latency and 0/6 joint passes and fell below Reactive on CPU deadline passes. An efficacy result and a validated forecasting lead time remain outstanding.[^h3]
+- **Historical CostAware.** The policy accepted 884 forecasts after invocation and achieved 0/6 latency and 0/6 joint passes. It had fewer CPU deadline passes than Reactive. Acquisition value, net benefit, and a causal explanation remain unresolved.[^h3]
