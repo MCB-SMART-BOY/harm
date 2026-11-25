@@ -1,4 +1,5 @@
 mod control;
+pub mod leadtime;
 mod score;
 mod session;
 mod trial;
