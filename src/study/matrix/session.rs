@@ -427,7 +427,7 @@ fn run_session(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| config_error("declare --llm-state for a matrix session"))?;
-    let pilot = m.stage == MatrixStage::Pilot;
+    let pilot = matches!(m.stage, MatrixStage::Pilot | MatrixStage::H3Pilot);
     let (session_index, eligible) = if pilot {
         (0, [true; 4])
     } else {

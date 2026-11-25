@@ -143,6 +143,103 @@ impl Predictor for EmaPredictor {
         )
     }
 }
+
+/// Deterministic 100k-parameter CPU MLP alternative for the configurable
+/// CostAware pilot. The input signal is replicated across 64 features because
+/// the matrix arm exposes one scalar observed signal at each tick.
+pub struct Mlp100kPredictor {
+    first: Vec<f32>,
+    first_bias: Vec<f32>,
+    second: Vec<f32>,
+    second_bias: Vec<f32>,
+    output: Vec<f32>,
+    output_bias: Vec<f32>,
+}
+
+impl Mlp100kPredictor {
+    pub fn new() -> Self {
+        const INPUTS: usize = 64;
+        const HIDDEN: usize = 283;
+        const OUTPUTS: usize = 4;
+        let mut state = 0xC0A5_AE10_0BEE_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state as u32) as f32 / u32::MAX as f32 - 0.5) * 0.02
+        };
+        let mut weights = |count| (0..count).map(|_| next()).collect();
+        Self {
+            first: weights(INPUTS * HIDDEN),
+            first_bias: weights(HIDDEN),
+            second: weights(HIDDEN * HIDDEN),
+            second_bias: weights(HIDDEN),
+            output: weights(HIDDEN * OUTPUTS),
+            output_bias: weights(OUTPUTS),
+        }
+    }
+}
+
+impl Default for Mlp100kPredictor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Predictor for Mlp100kPredictor {
+    fn predict(
+        &self,
+        window: &ObservationWindow,
+        action: &MetaAction,
+    ) -> Result<Prediction, PredictError> {
+        const INPUTS: usize = 64;
+        const HIDDEN: usize = 283;
+        const OUTPUTS: usize = 4;
+        let start = Instant::now();
+        let observation = window
+            .latest(&action.target)
+            .filter(|o| o.source == Source::Observed)
+            .ok_or(PredictError::NoObservation)?;
+        let input = observation.value as f32;
+        let mut hidden = vec![0.0; HIDDEN];
+        for (row, value) in hidden.iter_mut().enumerate() {
+            let offset = row * INPUTS;
+            let sum = self.first[offset..offset + INPUTS]
+                .iter()
+                .map(|weight| *weight * input)
+                .sum::<f32>()
+                + self.first_bias[row];
+            *value = sum.max(0.0);
+        }
+        let mut second = vec![0.0; HIDDEN];
+        for (row, value) in second.iter_mut().enumerate() {
+            let offset = row * HIDDEN;
+            let sum = self.second[offset..offset + HIDDEN]
+                .iter()
+                .zip(&hidden)
+                .map(|(weight, input)| *weight * input)
+                .sum::<f32>()
+                + self.second_bias[row];
+            *value = sum.max(0.0);
+        }
+        let mut output = [0.0; OUTPUTS];
+        for (row, value) in output.iter_mut().enumerate() {
+            let offset = row * HIDDEN;
+            *value = self.output[offset..offset + HIDDEN]
+                .iter()
+                .zip(&second)
+                .map(|(weight, input)| *weight * input)
+                .sum::<f32>()
+                + self.output_bias[row];
+        }
+        let value = f64::from(output[0]).clamp(0.0, 1.0);
+        set_inference_cost(
+            start,
+            prediction(value, observation, action, 0.25, Source::Predicted)?,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OraclePredictor {
     trace: Vec<Observation>,

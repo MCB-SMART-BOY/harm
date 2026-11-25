@@ -28,7 +28,17 @@ for every arm and therefore cannot support a universal service claim.
    [−35.71, 2.38] points. Figure 1 will plot the measured Pareto plane, and
    Table 2 will report the paired contrasts and their confidence intervals.
 
-3. **An explicit cost model for the meta-decision.** The analysis separates
+3. **A feasibility result for an observed-only CostAware meta-decision.** In
+   the six-seed, one-class W1 pilot on one host, CostAware made 884
+   `predict` decisions and 556 `skip` decisions, but reached 0/6 joint pass,
+   0/6 latency pass, and 4/6 CPU deadline pass. The exact supported claim is
+   that this EMA-based observed-only estimator ran end to end, produced
+   benefit-cost-positive decisions, and did not reproduce Oracle's latency
+   service or exceed Reactive on the pilot service plane. The pilot is
+   feasibility-only and cannot support efficacy, non-inferiority, or
+   cross-host claims.
+
+4. **An explicit cost model for the meta-decision.** The analysis separates
    active controller compute, apply-to-readback latency, proposal expiry, and
    prediction cost, then places those costs beside the service outcomes.
    Table 3 will report the cost ledger, and Figure 2 will show the
@@ -56,6 +66,9 @@ new trials or threshold changes.
 - Paired Oracle-versus-Static-low joint-pass analysis.
 - Controller tick compute, apply latency, verified-apply counts, expiry
   counts, Oracle forecast counts, and recorded prediction cost.
+- A six-seed W1 CostAware feasibility pilot with observed-only EMA decisions,
+  per-tick benefit and cost estimates, following-window outcomes, and
+  predictor wall-time accounting.
 - A primary-source Related Work matrix that defines the limits of the
   paper's claims.
 

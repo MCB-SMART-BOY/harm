@@ -214,6 +214,9 @@ fn validate_execution(cfg: &StudyConfig) -> Result<()> {
     let matrix = matrix_config(cfg)?;
     let registered = match matrix.stage {
         super::config::MatrixStage::Pilot => include_str!("../../../configs/matrix-pilot.json"),
+        super::config::MatrixStage::H3Pilot => {
+            include_str!("../../../configs/matrix-h3-pilot.json")
+        }
         super::config::MatrixStage::Full => include_str!("../../../configs/matrix-full.json"),
     };
     let expected: StudyConfig = serde_json::from_str(registered)?;
