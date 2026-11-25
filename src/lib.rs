@@ -30,6 +30,9 @@ impl Ratio {
     pub fn new(v: f64) -> Option<Self> {
         (v.is_finite() && (0.0..=1.0).contains(&v)).then_some(Self(v))
     }
+    pub fn get(self) -> f64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

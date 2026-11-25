@@ -46,13 +46,70 @@ pub struct MatrixConfig {
     pub deferred_arms: Vec<String>,
     pub manager_fill_threads: usize,
     pub cpu_job_duty_cycle: f64,
+    #[serde(default)]
+    pub cost_aware: CostAwareConfig,
     pub workloads: MatrixWorkloads,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostAwareConfig {
+    #[serde(default = "default_cost_aware_predictor")]
+    pub predictor: String,
+    #[serde(default = "default_cost_aware_ema_alpha")]
+    pub ema_alpha: f64,
+    #[serde(default = "default_cost_aware_window_ticks")]
+    pub window_ticks: usize,
+    #[serde(default = "default_cost_aware_horizon_secs")]
+    pub horizon_secs: f64,
+    #[serde(default = "default_cost_aware_budget_ms")]
+    pub predictor_budget_ms: f64,
+    #[serde(default = "default_cost_aware_background_delay")]
+    pub marginal_background_delay_per_protected_second: f64,
+}
+
+impl Default for CostAwareConfig {
+    fn default() -> Self {
+        Self {
+            predictor: default_cost_aware_predictor(),
+            ema_alpha: default_cost_aware_ema_alpha(),
+            window_ticks: default_cost_aware_window_ticks(),
+            horizon_secs: default_cost_aware_horizon_secs(),
+            predictor_budget_ms: default_cost_aware_budget_ms(),
+            marginal_background_delay_per_protected_second: default_cost_aware_background_delay(),
+        }
+    }
+}
+
+fn default_cost_aware_predictor() -> String {
+    "ema".into()
+}
+
+const fn default_cost_aware_ema_alpha() -> f64 {
+    0.5
+}
+
+const fn default_cost_aware_window_ticks() -> usize {
+    4
+}
+
+const fn default_cost_aware_horizon_secs() -> f64 {
+    0.5
+}
+
+const fn default_cost_aware_budget_ms() -> f64 {
+    2.0
+}
+
+const fn default_cost_aware_background_delay() -> f64 {
+    1.61
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixStage {
     Pilot,
+    H3Pilot,
     Full,
 }
 
@@ -107,7 +164,7 @@ pub struct MatrixTrainingWorkload {
 impl MatrixConfig {
     fn validate(&self, cfg: &StudyConfig) -> Result<(), String> {
         let sessions = match self.stage {
-            MatrixStage::Pilot => 1,
+            MatrixStage::Pilot | MatrixStage::H3Pilot => 1,
             MatrixStage::Full => 2,
         };
         if self.seeds_per_session == 0
@@ -127,10 +184,18 @@ impl MatrixConfig {
         {
             return Err("matrix primary and reserve seeds must be unique and positive".into());
         }
-        if cfg.arms != ["native", "static-low", "static-high", "reactive", "oracle"]
-            || self.deferred_arms != ["cost-aware"]
-        {
-            return Err("matrix stage 1 requires five active arms and deferred cost-aware".into());
+        let stage_arms_ok = match self.stage {
+            MatrixStage::Pilot | MatrixStage::Full => {
+                cfg.arms == ["native", "static-low", "static-high", "reactive", "oracle"]
+                    && self.deferred_arms == ["cost-aware"]
+            }
+            MatrixStage::H3Pilot => {
+                cfg.arms == ["native", "reactive", "oracle", "cost-aware"]
+                    && self.deferred_arms.is_empty()
+            }
+        };
+        if !stage_arms_ok {
+            return Err("invalid matrix arm set for the registered stage".into());
         }
         if cfg.slo_latency_threshold_ns.is_some() || cfg.background_deadline_secs.is_some() {
             return Err("matrix SLOs must be configured inside matrix.workloads".into());
@@ -146,6 +211,25 @@ impl MatrixConfig {
             return Err(
                 "matrix requires two protected phases and release windows >= 3 horizons".into(),
             );
+        }
+        if !["ema", "mlp-100k"].contains(&self.cost_aware.predictor.as_str())
+            || !self.cost_aware.ema_alpha.is_finite()
+            || !(0.0..=1.0).contains(&self.cost_aware.ema_alpha)
+            || self.cost_aware.window_ticks == 0
+            || !self.cost_aware.horizon_secs.is_finite()
+            || self.cost_aware.horizon_secs <= 0.0
+            || !self.cost_aware.predictor_budget_ms.is_finite()
+            || self.cost_aware.predictor_budget_ms <= 0.0
+            || !self
+                .cost_aware
+                .marginal_background_delay_per_protected_second
+                .is_finite()
+            || self
+                .cost_aware
+                .marginal_background_delay_per_protected_second
+                < 0.0
+        {
+            return Err("invalid cost-aware predictor configuration".into());
         }
         if cfg.static_weight != cfg.protected_weight
             || cfg.reactive_low_weight != cfg.protected_weight
@@ -423,6 +507,7 @@ mod tests {
     fn loads_preregistered_matrix_plans_and_keeps_them_out_of_the_legacy_runner() {
         for (file, stage, seeds_per_session, sessions) in [
             ("matrix-pilot.json", MatrixStage::Pilot, 6, 1),
+            ("matrix-h3-pilot.json", MatrixStage::H3Pilot, 6, 1),
             ("matrix-full.json", MatrixStage::Full, 21, 2),
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -291,6 +291,8 @@ fn execute(
         events_available.then_some(&events),
         job.as_ref(),
     );
+    let mut control = control;
+    control.attribute_following_windows(workload, matrix, phases, &events, job.as_ref());
     let thresholds = scores.thresholds(job.as_ref());
     if scores.joint_slo_pass.is_none() {
         voids.push(VoidReason::MissingTelemetry);
