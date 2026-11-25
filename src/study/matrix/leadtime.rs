@@ -1,18 +1,15 @@
-//! A6 lead-time primitives.
-//!
-//! This module is deliberately independent of the scored matrix runner until the A6
-//! amendment is accepted as a registered configuration. It provides the randomized
-//! schedule, the deployable intent transport, and the policy decision used by the
-//! implementation and its tests.
+//! A6 workload schedule and its one-way declaration transport.
 
-#![allow(dead_code)]
-
+use crate::Source;
 use serde::{Deserialize, Serialize};
 use std::{io, os::unix::net::UnixDatagram};
 
 const NS_PER_MS: u64 = 1_000_000;
 const MIN_TOTAL_MS: u64 = 11_000;
 const MAX_TOTAL_MS: u64 = 13_000;
+pub(super) const ENVELOPE_NS: u64 = MAX_TOTAL_MS * NS_PER_MS;
+pub(super) const HOLD_NS: u64 = 2_000 * NS_PER_MS;
+const MAX_WARNING_NS: u64 = 500 * NS_PER_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A6Schedule {
@@ -48,10 +45,6 @@ impl A6Schedule {
     pub fn total_ms(self) -> u64 {
         self.durations_ms.into_iter().sum()
     }
-
-    pub fn onset_ms(self, phase: usize) -> u64 {
-        self.starts_ms()[phase]
-    }
 }
 
 fn sample(state: &mut u64, min: u64, max: u64) -> u64 {
@@ -68,138 +61,169 @@ fn next_u64(state: &mut u64) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Intent {
-    pub phase: u8,
-    pub onset_ns: u64,
-    pub declared_at_ns: u64,
-    pub lead_ms: u64,
-    pub spurious: bool,
+#[serde(deny_unknown_fields)]
+pub(super) struct Intent {
+    pub onset_target_ns: u64,
+    pub sent_ns: u64,
 }
 
-impl Intent {
-    pub fn delivered_lead_ns(self, delivered_at_ns: u64) -> Option<u64> {
-        delivered_at_ns.checked_sub(self.declared_at_ns)
-    }
+pub(super) struct IntentSender(UnixDatagram);
+pub(super) struct IntentReceiver(UnixDatagram);
 
-    pub fn is_for(self, phase: usize, onset_ns: u64) -> bool {
-        self.phase as usize == phase && self.onset_ns == onset_ns && !self.spurious
-    }
-}
-
-#[derive(Debug)]
-pub struct IntentSender {
-    socket: UnixDatagram,
-}
-
-#[derive(Debug)]
-pub struct IntentReceiver {
-    socket: UnixDatagram,
-}
-
-pub fn intent_channel() -> io::Result<(IntentSender, IntentReceiver)> {
-    let (left, right) = UnixDatagram::pair()?;
-    left.set_nonblocking(true)?;
-    right.set_nonblocking(true)?;
-    Ok((
-        IntentSender { socket: left },
-        IntentReceiver { socket: right },
-    ))
+pub(super) fn intent_channel() -> io::Result<(IntentSender, IntentReceiver)> {
+    let (sender, receiver) = UnixDatagram::pair()?;
+    sender.set_nonblocking(true)?;
+    receiver.set_nonblocking(true)?;
+    Ok((IntentSender(sender), IntentReceiver(receiver)))
 }
 
 impl IntentSender {
-    pub fn send(&self, intent: Intent) -> io::Result<()> {
-        let bytes = serde_json::to_vec(&intent).expect("Intent is serializable");
-        self.socket.send(&bytes).map(|_| ())
+    pub fn declare(&self, onset_target_ns: u64) -> io::Result<Intent> {
+        let intent = Intent {
+            onset_target_ns,
+            sent_ns: super::now(),
+        };
+        self.0.send(&serde_json::to_vec(&intent)?)?;
+        Ok(intent)
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(super) struct Delivery {
+    pub intent: Intent,
+    pub received_ns: u64,
+    pub source: Source,
+    pub disposition: &'static str,
+}
+
 impl IntentReceiver {
-    pub fn drain(&self) -> io::Result<Vec<(Intent, u64)>> {
-        let mut result = Vec::new();
+    fn receive(&self) -> io::Result<Option<(Intent, u64)>> {
         let mut bytes = [0; 256];
-        loop {
-            match self.socket.recv(&mut bytes) {
-                Ok(size) => {
-                    let intent: Intent = serde_json::from_slice(&bytes[..size]).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("intent: {e}"))
-                    })?;
-                    result.push((intent, crate::control::monotonic_ns()));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(result),
-                Err(error) => return Err(error),
+        match self.0.recv(&mut bytes) {
+            Ok(size) if size < bytes.len() => {
+                let received_ns = super::now();
+                Ok(Some((serde_json::from_slice(&bytes[..size])?, received_ns)))
             }
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversize intent",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeclaredMode {
-    Ungated,
-    Gated,
-    Noisy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeclaredDecision {
-    pub protect: bool,
-    pub source_is_predicted: bool,
-    pub phase: Option<usize>,
-}
-
-/// Decide from received declarations only. A missing channel yields no declaration,
-/// which makes clock-only schedule recovery impossible by construction.
-#[allow(clippy::too_many_arguments)]
-pub fn declared_decision(
-    now_ns: u64,
-    intents: &[Intent],
+/// The policy holds only the receiver, the two weights, and the declared lease.
+pub(super) struct DeclaredPolicy {
+    receiver: IntentReceiver,
+    lease: Option<Intent>,
     protected_weight: u32,
     free_weight: u32,
-    current_weight: u32,
-    mode: DeclaredMode,
-    estimated_benefit: f64,
-    estimated_cost: f64,
-) -> (u32, DeclaredDecision) {
-    let intent = intents.iter().copied().find(|intent| {
-        !intent.spurious && intent.onset_ns >= now_ns && intent.onset_ns - now_ns <= 500 * NS_PER_MS
-    });
-    let should_protect = intent.is_some()
-        && match mode {
-            DeclaredMode::Gated => {
-                estimated_benefit.is_finite()
-                    && estimated_cost.is_finite()
-                    && estimated_benefit > estimated_cost
-            }
-            DeclaredMode::Ungated | DeclaredMode::Noisy => true,
-        };
-    (
-        if should_protect {
-            protected_weight
-        } else {
-            free_weight.max(current_weight.min(free_weight))
-        },
-        DeclaredDecision {
-            protect: should_protect,
-            source_is_predicted: mode == DeclaredMode::Gated && should_protect,
-            phase: intent.map(|intent| intent.phase as usize),
-        },
-    )
 }
 
-pub fn delivery_latency_percentiles(samples_ns: &mut [u64]) -> Option<(u64, u64, u64)> {
-    if samples_ns.is_empty() {
+#[derive(Debug, Serialize)]
+pub(super) struct DeclaredProposal {
+    pub weight: u32,
+    pub source: Source,
+    pub onset_target_ns: Option<u64>,
+    pub apply_before_ns: Option<u64>,
+}
+
+impl DeclaredPolicy {
+    pub fn new(receiver: IntentReceiver, protected_weight: u32, free_weight: u32) -> Self {
+        Self {
+            receiver,
+            lease: None,
+            protected_weight,
+            free_weight,
+        }
+    }
+
+    pub fn poll(
+        &mut self,
+        effective_weight: u32,
+        deliveries: &mut Vec<Delivery>,
+    ) -> io::Result<DeclaredProposal> {
+        // Bound each tick even if the sender is faulty.
+        for _ in 0..8 {
+            let Some((intent, received_ns)) = self.receiver.receive()? else {
+                break;
+            };
+            let disposition = self.accept(intent, received_ns);
+            deliveries.push(Delivery {
+                intent,
+                received_ns,
+                source: Source::Observed,
+                disposition,
+            });
+        }
+        Ok(self.proposal(super::now(), effective_weight))
+    }
+
+    fn accept(&mut self, intent: Intent, received_ns: u64) -> &'static str {
+        if intent.sent_ns > received_ns
+            || intent.onset_target_ns.saturating_sub(intent.sent_ns) > MAX_WARNING_NS
+        {
+            return "invalid";
+        }
+        if received_ns >= intent.onset_target_ns {
+            return "late";
+        }
+        if self
+            .lease
+            .is_some_and(|lease| received_ns < lease.onset_target_ns.saturating_add(HOLD_NS))
+        {
+            return "overlapping";
+        }
+        self.lease = Some(intent);
+        "accepted"
+    }
+
+    fn proposal(&self, now_ns: u64, effective_weight: u32) -> DeclaredProposal {
+        if let Some(intent) = self.lease {
+            let onset = intent.onset_target_ns;
+            let pre_onset = now_ns < onset;
+            if now_ns < onset.saturating_add(HOLD_NS)
+                && (pre_onset || effective_weight == self.protected_weight)
+            {
+                return DeclaredProposal {
+                    weight: self.protected_weight,
+                    source: Source::Predicted,
+                    onset_target_ns: Some(onset),
+                    apply_before_ns: pre_onset.then_some(onset),
+                };
+            }
+        }
+        DeclaredProposal {
+            weight: self.free_weight,
+            source: Source::Assumed,
+            onset_target_ns: None,
+            apply_before_ns: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LatencyPercentiles {
+    pub count: usize,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+}
+
+pub(super) fn delivery_latency_percentiles(mut samples: Vec<u64>) -> Option<LatencyPercentiles> {
+    if samples.is_empty() {
         return None;
     }
-    samples_ns.sort_unstable();
-    Some((
-        percentile(samples_ns, 0.5),
-        percentile(samples_ns, 0.95),
-        percentile(samples_ns, 0.99),
-    ))
-}
-
-fn percentile(samples: &[u64], probability: f64) -> u64 {
-    let index = (probability * (samples.len() - 1) as f64).ceil() as usize;
-    samples[index]
+    samples.sort_unstable();
+    let percentile = |p: f64| samples[(p * (samples.len() - 1) as f64).ceil() as usize];
+    Some(LatencyPercentiles {
+        count: samples.len(),
+        p50_ns: percentile(0.50),
+        p95_ns: percentile(0.95),
+        p99_ns: percentile(0.99),
+    })
 }
 
 #[cfg(test)]
@@ -211,127 +235,67 @@ mod tests {
         let first = A6Schedule::from_seed(1001);
         assert_eq!(first, A6Schedule::from_seed(1001));
         assert_ne!(first, A6Schedule::from_seed(1002));
-        assert!((3_000..=6_000).contains(&first.durations_ms[0]));
-        assert!((1_000..=2_000).contains(&first.durations_ms[1]));
-        assert!((3_000..=5_000).contains(&first.durations_ms[2]));
-        assert!((1_000..=2_000).contains(&first.durations_ms[3]));
+        for (ms, range) in first.durations_ms.into_iter().zip([
+            3_000..=6_000,
+            1_000..=2_000,
+            3_000..=5_000,
+            1_000..=2_000,
+        ]) {
+            assert!(range.contains(&ms));
+        }
         assert!((MIN_TOTAL_MS..=MAX_TOTAL_MS).contains(&first.total_ms()));
-        assert_eq!(first.starts_ms()[0], 0);
-        assert_eq!(first.starts_ms()[1], first.durations_ms[0]);
     }
 
     #[test]
-    fn intent_transport_reports_delivery_latency() {
+    fn socket_delivery_uses_monotonic_time_and_preserves_provenance() {
         let (sender, receiver) = intent_channel().unwrap();
-        let declared_at_ns = crate::control::monotonic_ns();
-        let intent = Intent {
-            phase: 1,
-            onset_ns: 10 * NS_PER_MS,
-            declared_at_ns,
-            lead_ms: 1_000,
-            spurious: false,
-        };
-        sender.send(intent).unwrap();
-        let received = receiver.drain().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].0, intent);
-        assert!(
-            received[0]
-                .0
-                .delivered_lead_ns(received[0].1)
-                .is_some_and(|ns| ns < NS_PER_MS)
-        );
+        let onset = super::super::now() + MAX_WARNING_NS;
+        let sent = sender.declare(onset).unwrap();
+        let mut policy = DeclaredPolicy::new(receiver, 20, 1000);
+        let mut deliveries = Vec::new();
+        let proposal = policy.poll(1000, &mut deliveries).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].intent, sent);
+        assert!((sent.sent_ns..=super::super::now()).contains(&deliveries[0].received_ns));
+        assert_eq!(deliveries[0].source, Source::Observed);
+        assert_eq!(proposal.source, Source::Predicted);
+        assert_eq!(proposal.apply_before_ns, Some(onset));
     }
 
     #[test]
-    fn non_declared_arms_have_no_schedule_channel() {
-        let schedule = A6Schedule::from_seed(7);
-        let (weight, decision) = declared_decision(
-            schedule.onset_ms(1) * NS_PER_MS - 100 * NS_PER_MS,
-            &[],
-            20,
-            1_000,
-            1_000,
-            DeclaredMode::Ungated,
-            1.0,
-            0.0,
-        );
-        assert_eq!(weight, 1_000);
-        assert!(!decision.protect);
-        assert_eq!(decision.phase, None);
+    fn missing_declaration_cannot_schedule_protection() {
+        let (_sender, receiver) = intent_channel().unwrap();
+        let mut policy = DeclaredPolicy::new(receiver, 20, 1000);
+        let mut deliveries = Vec::new();
+        let proposal = policy.poll(1000, &mut deliveries).unwrap();
+        assert!(deliveries.is_empty());
+        assert_eq!(proposal.weight, 1000);
+        assert_eq!(proposal.source, Source::Assumed);
+        assert!(proposal.onset_target_ns.is_none());
+        assert_eq!(policy.proposal(ENVELOPE_NS, 1000).weight, 1000);
     }
 
     #[test]
-    fn gate_contribution_is_separable_from_lead_time() {
-        let intent = Intent {
-            phase: 1,
-            onset_ns: 1_000 * NS_PER_MS,
-            declared_at_ns: 500 * NS_PER_MS,
-            lead_ms: 500,
-            spurious: false,
-        };
-        let (_, ungated) = declared_decision(
-            600 * NS_PER_MS,
-            &[intent],
-            20,
-            1_000,
-            1_000,
-            DeclaredMode::Ungated,
-            0.0,
-            1.0,
-        );
-        let (_, gated) = declared_decision(
-            600 * NS_PER_MS,
-            &[intent],
-            20,
-            1_000,
-            1_000,
-            DeclaredMode::Gated,
-            0.0,
-            1.0,
-        );
-        assert!(ungated.protect);
-        assert!(!gated.protect);
-    }
-
-    #[test]
-    fn percentile_summary_is_unavailable_for_no_samples() {
-        assert_eq!(delivery_latency_percentiles(&mut []), None);
-        assert_eq!(
-            delivery_latency_percentiles(&mut [30, 10, 20]),
-            Some((20, 30, 30))
-        );
-    }
-
-    #[test]
-    fn transport_does_not_reveal_schedule_without_a_declaration() {
-        let schedule = A6Schedule::from_seed(42);
+    fn valid_looking_false_intent_expires_and_cannot_protect_late() {
         let (_, receiver) = intent_channel().unwrap();
-        let before = receiver.drain().unwrap();
-        assert!(before.is_empty());
-        assert!(schedule.starts_ms().iter().all(|_| before.is_empty()));
+        let mut policy = DeclaredPolicy::new(receiver, 20, 1000);
+        let intent = Intent {
+            onset_target_ns: 500 * NS_PER_MS,
+            sent_ns: 0,
+        };
+        let onset = intent.onset_target_ns;
+        assert_eq!(policy.accept(intent, onset), "late");
+        assert_eq!(policy.accept(intent, 1), "accepted");
+        assert_eq!(policy.proposal(onset - 1, 1000).weight, 20);
+        assert_eq!(policy.proposal(onset, 1000).weight, 1000);
+        assert_eq!(policy.proposal(onset + HOLD_NS - 1, 20).weight, 20);
+        assert_eq!(policy.proposal(onset + HOLD_NS, 20).weight, 1000);
     }
 
     #[test]
-    fn spurious_intents_are_ignored_by_clean_policy() {
-        let intent = Intent {
-            phase: 1,
-            onset_ns: 1_000 * NS_PER_MS,
-            declared_at_ns: 500 * NS_PER_MS,
-            lead_ms: 500,
-            spurious: true,
-        };
-        let (weight, decision) = declared_decision(
-            600 * NS_PER_MS,
-            &[intent],
-            20,
-            1_000,
-            1_000,
-            DeclaredMode::Noisy,
-            1.0,
-            0.0,
-        );
-        assert_eq!(weight, 1_000);
-        assert!(!decision.protect);
+    fn no_latency_samples_means_unavailable() {
+        assert!(delivery_latency_percentiles(vec![]).is_none());
+        let sample = delivery_latency_percentiles(vec![30, 10, 20]).unwrap();
+        assert_eq!((sample.p50_ns, sample.p95_ns, sample.p99_ns), (20, 30, 30));
     }
 }

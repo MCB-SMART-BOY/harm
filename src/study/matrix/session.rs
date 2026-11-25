@@ -101,6 +101,7 @@ struct Launcher<'a> {
     session: &'a str,
     oracle_dir: &'a Path,
     llm_pids: &'a [u32],
+    a6: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -167,7 +168,7 @@ impl Launcher<'_> {
             "--trace",
         ])
         .arg(path);
-        if arm == "oracle" {
+        if arm == "oracle" && !self.a6 {
             cmd.arg("--oracle-trace")
                 .arg(trace_file(self.oracle_dir, class, seed));
         }
@@ -244,6 +245,11 @@ pub fn record_matrix_reference(
 ) -> Result<()> {
     validate_execution(cfg)?;
     validate_trial_arm(cfg, class, Arm::Native, true)?;
+    if matrix_config(cfg)?.stage.is_a6() {
+        return Err(config_error(
+            "A6 uses a randomized schedule for its Oracle comparator",
+        ));
+    }
     if cfg!(debug_assertions) {
         return Err(config_error("matrix references require a release build"));
     }
@@ -261,6 +267,7 @@ pub fn record_matrix_reference(
         session: "reference",
         oracle_dir: dir,
         llm_pids: &[],
+        a6: false,
     };
     let summary = launcher.launch(class, "native", seed, 0, &path, Purpose::Reference)?;
     if !valid(&summary) {
@@ -302,7 +309,11 @@ pub fn run_matrix(
         session,
         oracle_dir,
         llm_pids: &options.llm_pid,
+        a6: matrix_config(cfg)?.stage.is_a6(),
     };
+    if launcher.a6 && options.smoke {
+        return Err(config_error("A6 requires a registered cohort"));
+    }
     if options.smoke {
         let class = options
             .workload
@@ -363,6 +374,64 @@ fn cooldown(baseline: &std::collections::BTreeMap<String, f64>) -> Option<u64> {
         }
         sleep_until((now() + 5 * SECOND).min(start + 120 * SECOND));
     }
+}
+
+fn a6_pilot_validity(blocks: &[Vec<Value>], arms: &[String]) -> Value {
+    let mut arms_report = serde_json::Map::new();
+    let mut headroom = false;
+    let mut onsets: [std::collections::BTreeSet<u64>; 2] = Default::default();
+    let mut randomized_delivery = blocks.len() == 6;
+    for arm in arms {
+        let mut valid_count = 0;
+        let mut pass = 0;
+        let mut miss = 0;
+        let declared = arm.starts_with("declared-");
+        for block in blocks {
+            if let Some(row) = block.iter().find(|row| row["arm"] == arm.as_str()) {
+                if valid(row) {
+                    valid_count += 1;
+                    pass += usize::from(row["joint_slo_pass"] == true);
+                    miss += usize::from(row["joint_slo_pass"] == false);
+                }
+                if declared {
+                    let phases = row["a6_leadtime"]["phases"].as_array();
+                    let gate = row["a6_leadtime"]["gate_ns"].as_u64();
+                    for (i, offsets) in onsets.iter_mut().enumerate() {
+                        let phase = phases.and_then(|rows| rows.get(i));
+                        if let Some(offset) = phase
+                            .filter(|p| p["accepted_intent"]["disposition"] == "accepted")
+                            .and_then(|p| p["onset_target_ns"].as_u64())
+                            .zip(gate)
+                            .and_then(|(target, at)| target.checked_sub(at))
+                        {
+                            offsets.insert(offset);
+                        } else {
+                            randomized_delivery = false;
+                        }
+                    }
+                }
+            } else if declared {
+                randomized_delivery = false;
+            }
+        }
+        headroom |= pass > 0 && miss > 0;
+        arms_report.insert(
+            arm.clone(),
+            json!({
+                "valid_count": valid_count, "void_or_missing_count": 6 - valid_count,
+                "joint_pass": pass, "joint_miss": miss,
+            }),
+        );
+    }
+    randomized_delivery &= onsets.iter().all(|offsets| offsets.len() == 6);
+    let valid = arms_report
+        .values()
+        .all(|row| row["void_or_missing_count"] == 0);
+    json!({
+        "kind":"matrix_a6_pilot_validity", "eligible": valid && randomized_delivery && headroom,
+        "arms": arms_report, "randomized_delivery": randomized_delivery,
+        "distinct_onset_counts": onsets.map(|offsets| offsets.len()), "joint_headroom": headroom,
+    })
 }
 
 fn compare_sequences(rows: &mut [Value]) {
@@ -431,16 +500,39 @@ fn run_session(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| config_error("declare --llm-state for a matrix session"))?;
-    let pilot = m.stage == MatrixStage::Pilot;
+    if m.stage.is_a6() && (llm_state != "resident-idle" || options.llm_pid.is_empty()) {
+        return Err(config_error(
+            "A6 requires --llm-state resident-idle and a resident PID",
+        ));
+    }
+    let pilot = matches!(m.stage, MatrixStage::Pilot | MatrixStage::A6Pilot);
     let (session_index, eligible) = if pilot {
-        (0, [true; 4])
+        (
+            0,
+            if m.stage.is_a6() {
+                [true, false, false, false]
+            } else {
+                [true; 4]
+            },
+        )
     } else {
         let report = options
             .matrix_pilot_report
             .as_ref()
             .ok_or_else(|| config_error("matrix full requires --matrix-pilot-report"))?;
         let report: Value = serde_json::from_slice(&fs::read(report)?)?;
-        if report["kind"] != "matrix_pilot_validity" {
+        if m.stage.is_a6() {
+            if report["kind"] != "matrix_a6_pilot_validity"
+                || report["eligible"] != true
+                || report["binary_sha256"] != binary_hash
+                || report["llm_state"] != llm_state
+                || report["boot_id"] != json!(boot_id)
+            {
+                return Err(config_error(
+                    "A6 requires an eligible pilot with the same binary, boot and residency",
+                ));
+            }
+        } else if report["kind"] != "matrix_pilot_validity" {
             return Err(config_error("invalid pilot validity report"));
         }
         let index = match launcher.session {
@@ -483,7 +575,11 @@ fn run_session(
         };
         (
             index,
-            MatrixClass::ALL.map(|c| report["classes"][c.name()]["eligible"] == true),
+            if m.stage.is_a6() {
+                [true, false, false, false]
+            } else {
+                MatrixClass::ALL.map(|c| report["classes"][c.name()]["eligible"] == true)
+            },
         )
     };
     if !eligible.iter().any(|eligible| *eligible) {
@@ -497,7 +593,7 @@ fn run_session(
     seeds.sort_unstable();
     seeds.extend(&m.reserve_seeds[session_index]);
     // Check all future inputs before the first gated trial.
-    for &seed in &seeds {
+    for &seed in seeds.iter().filter(|_| !launcher.a6) {
         for class in MatrixClass::ALL
             .into_iter()
             .filter(|c| eligible[*c as usize])
@@ -528,6 +624,7 @@ fn run_session(
     let mut seen = [[[false; 2]; 3]; 4];
     let mut index = 0;
     let mut stopped = false;
+    let mut a6_pilot_blocks = Vec::new();
     'seeds: for (i, seed) in seeds.into_iter().enumerate() {
         let reserve = i >= m.seeds_per_session;
         for class in order(seed) {
@@ -564,6 +661,9 @@ fn run_session(
                         }
                     }
                 }
+                if m.stage == MatrixStage::A6Pilot {
+                    a6_pilot_blocks.push(rows.clone());
+                }
             }
             manifest.write(&json!({
                 "kind": "matrix_seed_block", "workload": class, "seed": seed, "reserve": reserve,
@@ -572,7 +672,14 @@ fn run_session(
             manifest.flush()?;
         }
     }
-    if pilot {
+    if m.stage == MatrixStage::A6Pilot {
+        let mut verdict = a6_pilot_validity(&a6_pilot_blocks, &cfg.arms);
+        verdict["eligible"] = json!(verdict["eligible"] == true && !stopped);
+        verdict["binary_sha256"] = json!(binary_hash);
+        verdict["boot_id"] = json!(boot_id);
+        verdict["llm_state"] = json!(llm_state);
+        write_once(&dir.join("a6-pilot-validity.json"), &verdict)?;
+    } else if pilot {
         let classes: serde_json::Map<String, Value> = MatrixClass::ALL.into_iter().map(|class| {
             let both = seen[class as usize];
             let eligible = !stopped && both.iter().all(|&outcomes| outcomes == [true, true]);

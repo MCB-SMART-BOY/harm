@@ -367,3 +367,53 @@ service-loss units, measured overhead and verified lead time where relevant,
 and phase onsets unavailable to the online policies. This amendment
 registers feasibility and the decision formula. Accuracy and efficacy
 estimates require new measurements.
+
+**A6, 2026-11-25 (Asia/Shanghai), registered after A7 and before any A6
+measurement.** Run a six-seed W1 feasibility pilot under A4 isolation,
+with the release binary and one resident-idle LLM state (no generation).
+Run Native, Static-low, Reactive, Oracle, Declared-250 and Declared-500
+in randomized order per seed. A6 defers CostAware pending independent A7
+calibration and a paired always-predict comparison with `ObservedDecisionInput`.
+Use the frozen configurations, delivery checks and analysis in
+[A6-LEADTIME.md](A6-LEADTIME.md).
+
+Draw idle/burst/steady/spike durations per seed in 3–6/1–2/3–5/1–2 s
+respectively, in integer milliseconds, rejecting draws outside the
+11–13 s total range. Vary actual foreground demand by pacing idle and
+steady at one outstanding probe and a minimum 1 ms between releases,
+and run probes back-to-back during burst and spike. Use a common 13 s
+controller and CPU-job envelope so the online run length cannot encode
+phase boundaries and CPU work remains observable through the unchanged
+12 s deadline. W1 still probes all phases. Keep the 2 ms protected p99
+SLOs, 750 million updates per CPU worker, existing weights and 50 ms ticks.
+
+Only Oracle receives the counterfactual seed's randomized boundaries.
+The workload alone sends a Unix datagram with an onset target and actual
+monotonic send timestamp at the requested 250 or 500 ms warning. Each
+declared arm requests protection after receipt, expires any unapplied
+protect proposal by onset or the end of the tick, and holds applied
+protection through target plus 2 s. The extra lease time is prespecified
+and can cost CPU service. During free intervals the declared policy
+requests high weight. Reactive uses the A7 trailing 200 ms observed W1
+p90, without phase filtering. Score actual onset at the first probe
+release in each protected phase. Record planned onset, and the observed
+send, receive, release and verified readback timestamps on the common
+monotonic clock. A delivered intent is Observed; the low-weight
+proposal inferred from it is Predicted, and the Oracle is StudyOracle.
+Classify false alarms after the trial by matching declarations to
+workload onsets. Clean arms receive only truthful declarations, so
+measured false alarm counts describe transport/matching under truthful
+inputs, not behavior under a noisy upstream predictor.
+
+A missing or late intent, unmatched extra intent, unsupported effective
+sequence, stale apply, failed/missing readback, or missing timing evidence
+voids the trial. A write refused on expiry is an A3 no-op. It may explain
+an omitted transition if the refusal is logged for that decision. Require
+on-time delivery and distinct randomized onsets for both phases across
+all six seeds, and require at least one arm to have valid joint-SLO passes
+and misses. Require ≤5% voids in each arm, so one void out of six fails.
+If the pilot fails, stop. If it passes, run two sessions of 21 complete
+blocks at least 15 minutes apart, with frozen seed/reserve order and the
+existing thermal cooldown. Use the same release binary and residency
+state. Score complete blocks using the paired A5 margins and the frozen
+A6 contrasts. No pilot seed contributes to the scored cohort.

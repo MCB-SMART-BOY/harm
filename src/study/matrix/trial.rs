@@ -1,5 +1,6 @@
 use super::{
     control::{Arm, Controller, Oracle, Reference, weights},
+    leadtime::{DeclaredPolicy, ENVELOPE_NS, intent_channel},
     score::{completion, score, stream_voids},
     workload::{CpuChild, Fillers, Foreground, Gate, verify_nice, worker_seed},
     *,
@@ -168,13 +169,19 @@ fn execute(
 ) -> Result<Value> {
     let workload = input.workload;
     let matrix = matrix_config(cfg)?;
-    let phases = Phases::new(cfg.phase_durations_secs);
+    let phases = Phases::for_trial(cfg, input.seed)?;
+    let a6 = matrix.stage.is_a6();
+    let total_ns = if a6 { ENVELOPE_NS } else { phases.total() };
     let oracle = if arm == Arm::Oracle {
-        let path = input
-            .oracle_trace
-            .as_ref()
-            .ok_or_else(|| config_error("Oracle requires a separate reference trace"))?;
-        Some(Oracle::load(path, workload, input.seed, phases)?)
+        Some(if a6 {
+            Oracle::randomized(phases)
+        } else {
+            let path = input
+                .oracle_trace
+                .as_ref()
+                .ok_or_else(|| config_error("Oracle requires a separate reference trace"))?;
+            Oracle::load(path, workload, input.seed, phases)?
+        })
     } else {
         None
     };
@@ -197,7 +204,8 @@ fn execute(
     let controller = Controller {
         cfg,
         scope,
-        phases,
+        legacy_observation_phases: (!matrix.stage.phase_blind()).then_some(phases),
+        total_ns,
         class: workload,
         arm,
         oracle: oracle.as_ref(),
@@ -212,12 +220,26 @@ fn execute(
     cpu.wait_ready()?;
     let mut manager = Fillers::manager(matrix.manager_fill_threads, input.seed)?;
     let before = host_snapshot(&input.llm_pid);
+    let (sender, declared) = if let Some(lead) = arm.declared_lead_ns() {
+        let (sender, receiver) = intent_channel()?;
+        (
+            Some((sender, lead)),
+            Some(DeclaredPolicy::new(
+                receiver,
+                cfg.protected_weight,
+                cfg.free_weight,
+            )),
+        )
+    } else {
+        (None, None)
+    };
     let mut foreground = Foreground::prepare(
         workload,
         matrix,
         phases,
         input.seed,
         cfg.control_tick_ms * MS,
+        sender,
     )?;
     // All foreground workers, manager fillers, and the CPU child inherit 2–3.
     // Only the trial thread moves. It runs both controller ticks and observation.
@@ -231,26 +253,28 @@ fn execute(
         "scope": scope.root, "manager_cgroup": scope.manager,
         "workload_cgroup": scope.workload(), "verified_workload_pid": cpu.pid(), "initial_leaf_weight": INITIAL_WEIGHT,
         "config": cfg, "cpu_updates_per_thread": quota, "adapter": foreground.adapter,
-        "oracle_trace_sha256": oracle.as_ref().map(|r| &r.hash), "before_warmup": before,
+        "oracle_trace_sha256": oracle.as_ref().filter(|_| !a6).map(|r| &r.hash),
+        "oracle_schedule_sha256": oracle.as_ref().filter(|_| a6).map(|r| &r.hash),
+        "before_warmup": before,
     }))?;
     // All participants are initialized and waiting; the future gate lets each
     // receive the same absolute timestamp before its scheduled start.
     let at = now() + 100 * MS;
     let gate = Gate {
         at,
-        end: at + phases.total(),
+        end: at + total_ns,
     };
     cpu.start(gate)?;
     manager.start(gate)?;
     foreground.start(at)?;
-    let control_result = controller.run(at, &foreground.events);
+    let control_result = controller.run(at, &foreground.events, declared);
     let usage_after = cgroup_usage(scope);
     let foreground_result = foreground.finish();
     let after = host_snapshot(&input.llm_pid);
     let cpu_result = cpu.finish();
     let manager_result = manager.join();
     let control = control_result?;
-    let (overhead, mut voids) = control.validate(&audit, arm, phases, cfg);
+    let (overhead, mut voids) = control.validate(&audit, arm, phases, cfg, total_ns);
     if FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT) {
         voids.push(VoidReason::FailedRestoration);
     }
@@ -274,7 +298,7 @@ fn execute(
             voids.push(VoidReason::PhaseOrSeedMismatch);
             return None;
         }
-        completion(workers, cfg.bg_threads, phases.total(), at, deadline)
+        completion(workers, cfg.bg_threads, total_ns, at, deadline)
     });
     if manager_result.as_ref().is_ok_and(|workers| {
         workers.len() != matrix.manager_fill_threads
@@ -304,14 +328,22 @@ fn execute(
         job.as_ref(),
     );
     let mut control = control;
-    control.attribute_following_windows(workload, matrix, phases, &events, job.as_ref());
+    let leadtime = a6.then(|| {
+        let sent = foreground.sent_intents.lock().expect("finished intent log");
+        let (evidence, reasons) = control.leadtime_evidence(arm, phases, at, cfg, (&events, &sent));
+        voids.extend(reasons);
+        evidence
+    });
+    if !a6 {
+        control.attribute_following_windows(workload, matrix, phases, &events, job.as_ref());
+    }
     let thresholds = scores.thresholds(job.as_ref());
     if scores.joint_slo_pass.is_none() {
         voids.push(VoidReason::MissingTelemetry);
     }
     file.write(&json!({
         "kind": "matrix_gate", "gate_monotonic_ns": at, "source": Source::Observed,
-        "controller_first_decision_monotonic_ns": control.began_at_ns,
+        "controller_first_decision_monotonic_ns": control.began_at_ns, "controller_end_monotonic_ns": gate.end,
     }))?;
     for (phase, name) in NAMES.into_iter().enumerate() {
         file.write(&json!({
@@ -323,7 +355,7 @@ fn execute(
     if input.reference && voids.is_empty() {
         file.write(&json!({"kind":"matrix_reference", "trace": Reference {
             schema_version: 2, workload, seed: input.seed, gate_monotonic_ns: at,
-            phase_starts_monotonic_ns: [0, 1, 2, 3].map(|p| at + phases.start(p)), end_monotonic_ns: gate.end,
+            phase_starts_monotonic_ns: [0, 1, 2, 3].map(|p| at + phases.start(p)), end_monotonic_ns: at + phases.total(),
         }}))?;
     }
     for tick in &control.ticks {
@@ -352,8 +384,9 @@ fn execute(
             "seed": input.seed, "arm": arm, "session": input.session, "order_index": input.order_index,
             "source": Source::Observed, "ended_unix_seconds": wall_time(), "after_drain": after,
             "background_completion": job, "threshold_passes": thresholds, "controller_overhead": overhead,
-            "controller_tick_timing": control.tick_timing(phases, cfg),
-            "expiry_metrics": control.expiry_metrics(phases, cfg),
+            "controller_tick_timing": control.tick_timing(total_ns, cfg),
+            "expiry_metrics": control.expiry_metrics(total_ns, cfg),
+            "a6_leadtime": leadtime,
             "prediction_and_observation_cost": controller_costs,
             "prediction_cost_ns": controller_costs["prediction_cost_ns"],
             "effective_weight_sequence": weights(&control.actions), "control_actions": control.actions.len(),
