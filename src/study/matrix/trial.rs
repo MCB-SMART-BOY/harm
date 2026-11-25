@@ -71,6 +71,12 @@ pub fn run_matrix_in_scope(input: &MatrixTrial) -> Result<()> {
         let cfg = StudyConfig::from_file(&input.config).map_err(config_error)?;
         validate_execution(&cfg)?;
         let arm = Arm::parse(&input.arm)?;
+        validate_trial_arm(
+            &cfg,
+            input.workload,
+            arm,
+            input.feasibility || input.reference,
+        )?;
         if !cfg.seeds.contains(&input.seed)
             && !matrix_config(&cfg)?
                 .reserve_seeds
@@ -206,7 +212,13 @@ fn execute(
     cpu.wait_ready()?;
     let mut manager = Fillers::manager(matrix.manager_fill_threads, input.seed)?;
     let before = host_snapshot(&input.llm_pid);
-    let mut foreground = Foreground::prepare(workload, matrix, phases, input.seed)?;
+    let mut foreground = Foreground::prepare(
+        workload,
+        matrix,
+        phases,
+        input.seed,
+        cfg.control_tick_ms * MS,
+    )?;
     // All foreground workers, manager fillers, and the CPU child inherit 2–3.
     // Only the trial thread moves. It runs both controller ticks and observation.
     pin_controller()?;
@@ -242,7 +254,7 @@ fn execute(
     if FileCgroupIo.read_weight(scope.workload()).ok() != Some(INITIAL_WEIGHT) {
         voids.push(VoidReason::FailedRestoration);
     }
-    let events = foreground.events.lock().expect("finished foreground");
+    let events = foreground.events.raw.lock().expect("finished foreground");
     let stream_reasons = stream_voids(workload, phases, matrix, &events);
     let events_available = foreground_result.is_ok()
         && !stream_reasons.iter().any(|r| {
@@ -332,6 +344,7 @@ fn execute(
     voids.sort_by_key(|r| *r as u8);
     voids.dedup();
 
+    let controller_costs = control.costs();
     let mut summary = serde_json::to_value(scores)?;
     summary.as_object_mut().expect("scores object").extend(
         json!({
@@ -341,8 +354,8 @@ fn execute(
             "background_completion": job, "threshold_passes": thresholds, "controller_overhead": overhead,
             "controller_tick_timing": control.tick_timing(phases, cfg),
             "expiry_metrics": control.expiry_metrics(phases, cfg),
-            "prediction_and_observation_cost": control.costs(),
-            "prediction_cost_ns": control.costs()["prediction_cost_ns"],
+            "prediction_and_observation_cost": controller_costs,
+            "prediction_cost_ns": controller_costs["prediction_cost_ns"],
             "effective_weight_sequence": weights(&control.actions), "control_actions": control.actions.len(),
             "weight_switches": control.actions.len(), "void_reasons": voids, "workload_errors": workload_errors,
             "background_cpu_usec": usage_after.zip(usage_before).and_then(|(a,b)| a.checked_sub(b)),

@@ -64,8 +64,46 @@ pub struct CostAwareConfig {
     pub horizon_secs: f64,
     #[serde(default = "default_cost_aware_budget_ms")]
     pub predictor_budget_ms: f64,
-    #[serde(default = "default_cost_aware_background_delay")]
-    pub marginal_background_delay_per_protected_second: f64,
+    /// Historical H3 field, accepted for archival loading only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marginal_background_delay_per_protected_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_calibration: Option<ServiceCalibration>,
+}
+
+/// Parameters fixed from independent evidence before an A7 trial.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceCalibration {
+    pub version: String,
+    pub evidence: String,
+    pub violation_equivalents_per_overhead_second: f64,
+    pub actuation_seconds: f64,
+    pub action_duration_secs: f64,
+    pub foreground_risk_reduction_fraction: f64,
+    pub background_baseline_miss_probability: f64,
+    pub background_marginal_miss_probability_per_action_second: f64,
+    pub max_background_miss_probability: f64,
+}
+
+impl ServiceCalibration {
+    pub(crate) fn valid(&self) -> bool {
+        !self.version.trim().is_empty()
+            && !self.evidence.trim().is_empty()
+            && self.violation_equivalents_per_overhead_second.is_finite()
+            && self.violation_equivalents_per_overhead_second > 0.0
+            && self.actuation_seconds.is_finite()
+            && self.actuation_seconds >= 0.0
+            && self.action_duration_secs.is_finite()
+            && self.action_duration_secs > 0.0
+            && (0.0..=1.0).contains(&self.foreground_risk_reduction_fraction)
+            && (0.0..=1.0).contains(&self.background_baseline_miss_probability)
+            && (0.0..=1.0).contains(&self.max_background_miss_probability)
+            && self
+                .background_marginal_miss_probability_per_action_second
+                .is_finite()
+            && self.background_marginal_miss_probability_per_action_second >= 0.0
+    }
 }
 
 impl Default for CostAwareConfig {
@@ -76,7 +114,8 @@ impl Default for CostAwareConfig {
             window_ticks: default_cost_aware_window_ticks(),
             horizon_secs: default_cost_aware_horizon_secs(),
             predictor_budget_ms: default_cost_aware_budget_ms(),
-            marginal_background_delay_per_protected_second: default_cost_aware_background_delay(),
+            marginal_background_delay_per_protected_second: None,
+            service_calibration: None,
         }
     }
 }
@@ -101,15 +140,12 @@ const fn default_cost_aware_budget_ms() -> f64 {
     2.0
 }
 
-const fn default_cost_aware_background_delay() -> f64 {
-    1.61
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixStage {
     Pilot,
     H3Pilot,
+    A7Pilot,
     Full,
 }
 
@@ -162,9 +198,9 @@ pub struct MatrixTrainingWorkload {
 }
 
 impl MatrixConfig {
-    fn validate(&self, cfg: &StudyConfig) -> Result<(), String> {
+    pub(super) fn validate(&self, cfg: &StudyConfig) -> Result<(), String> {
         let sessions = match self.stage {
-            MatrixStage::Pilot | MatrixStage::H3Pilot => 1,
+            MatrixStage::Pilot | MatrixStage::H3Pilot | MatrixStage::A7Pilot => 1,
             MatrixStage::Full => 2,
         };
         if self.seeds_per_session == 0
@@ -189,7 +225,7 @@ impl MatrixConfig {
                 cfg.arms == ["native", "static-low", "static-high", "reactive", "oracle"]
                     && self.deferred_arms == ["cost-aware"]
             }
-            MatrixStage::H3Pilot => {
+            MatrixStage::H3Pilot | MatrixStage::A7Pilot => {
                 cfg.arms == ["native", "reactive", "oracle", "cost-aware"]
                     && self.deferred_arms.is_empty()
             }
@@ -212,24 +248,37 @@ impl MatrixConfig {
                 "matrix requires two protected phases and release windows >= 3 horizons".into(),
             );
         }
-        if !["ema", "mlp-100k"].contains(&self.cost_aware.predictor.as_str())
+        if (self.cost_aware.predictor != "ema"
+            && !(self.stage == MatrixStage::H3Pilot && self.cost_aware.predictor == "mlp-100k"))
             || !self.cost_aware.ema_alpha.is_finite()
             || !(0.0..=1.0).contains(&self.cost_aware.ema_alpha)
-            || self.cost_aware.window_ticks == 0
+            || !(1..=64).contains(&self.cost_aware.window_ticks)
             || !self.cost_aware.horizon_secs.is_finite()
             || self.cost_aware.horizon_secs <= 0.0
             || !self.cost_aware.predictor_budget_ms.is_finite()
             || self.cost_aware.predictor_budget_ms <= 0.0
-            || !self
-                .cost_aware
-                .marginal_background_delay_per_protected_second
-                .is_finite()
             || self
                 .cost_aware
                 .marginal_background_delay_per_protected_second
-                < 0.0
+                .is_some_and(|delay| {
+                    self.stage != MatrixStage::H3Pilot || !delay.is_finite() || delay < 0.0
+                })
         {
             return Err("invalid cost-aware predictor configuration".into());
+        }
+        match (self.stage, &self.cost_aware.service_calibration) {
+            (MatrixStage::A7Pilot, Some(calibration))
+                if calibration.valid()
+                    && calibration.action_duration_secs == cfg.control_tick_ms as f64 / 1000.0
+                    && calibration.action_duration_secs <= self.cost_aware.horizon_secs => {}
+            (MatrixStage::A7Pilot, _) => {
+                return Err(
+                    "A7 requires a valid, versioned service calibration and a one-tick action"
+                        .into(),
+                );
+            }
+            (_, None) => {}
+            _ => return Err("service calibration is only accepted in the A7 pilot".into()),
         }
         if cfg.static_weight != cfg.protected_weight
             || cfg.reactive_low_weight != cfg.protected_weight

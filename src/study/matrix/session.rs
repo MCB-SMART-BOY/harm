@@ -243,6 +243,7 @@ pub fn record_matrix_reference(
     seed: u64,
 ) -> Result<()> {
     validate_execution(cfg)?;
+    validate_trial_arm(cfg, class, Arm::Native, true)?;
     if cfg!(debug_assertions) {
         return Err(config_error("matrix references require a release build"));
     }
@@ -311,7 +312,7 @@ pub fn run_matrix(
             .filter(|seed| cfg.seeds.contains(seed))
             .ok_or_else(|| config_error("--smoke requires a registered --seed"))?;
         let arm = options.arm.as_deref().unwrap_or("native");
-        Arm::parse(arm)?;
+        validate_trial_arm(cfg, class, Arm::parse(arm)?, true)?;
         fs::create_dir_all(dir)?;
         let path = dir.canonicalize()?;
         if path
@@ -335,6 +336,9 @@ pub fn run_matrix(
             ));
         }
         return Ok(());
+    }
+    if matrix_config(cfg)?.stage == MatrixStage::A7Pilot {
+        return Err(config_error("A7 does not register a scored matrix session"));
     }
     run_session(cfg, dir, options, &launcher)
 }
@@ -427,7 +431,7 @@ fn run_session(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| config_error("declare --llm-state for a matrix session"))?;
-    let pilot = matches!(m.stage, MatrixStage::Pilot | MatrixStage::H3Pilot);
+    let pilot = m.stage == MatrixStage::Pilot;
     let (session_index, eligible) = if pilot {
         (0, [true; 4])
     } else {

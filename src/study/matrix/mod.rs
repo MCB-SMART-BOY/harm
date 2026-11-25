@@ -8,7 +8,7 @@ pub use session::{MatrixRun, record_matrix_reference, run_matrix};
 pub use trial::{MatrixTrial, run_matrix_in_scope};
 pub use workload::run_fixed_worker;
 
-use super::config::{MatrixConfig, StudyConfig};
+use super::config::{MatrixConfig, MatrixStage, StudyConfig};
 use gpu_probe::GpuError;
 use rustix::time::{ClockId, Timespec};
 use serde::{Deserialize, Serialize};
@@ -213,13 +213,28 @@ impl Phases {
 fn validate_execution(cfg: &StudyConfig) -> Result<()> {
     let matrix = matrix_config(cfg)?;
     let registered = match matrix.stage {
-        super::config::MatrixStage::Pilot => include_str!("../../../configs/matrix-pilot.json"),
-        super::config::MatrixStage::H3Pilot => {
+        MatrixStage::Pilot => include_str!("../../../configs/matrix-pilot.json"),
+        MatrixStage::H3Pilot => {
+            return Err(config_error(
+                "H3 is historical only. A7 requires an independent service calibration.",
+            ));
+        }
+        MatrixStage::A7Pilot => {
             include_str!("../../../configs/matrix-h3-pilot.json")
         }
-        super::config::MatrixStage::Full => include_str!("../../../configs/matrix-full.json"),
+        MatrixStage::Full => include_str!("../../../configs/matrix-full.json"),
     };
-    let expected: StudyConfig = serde_json::from_str(registered)?;
+    let mut expected: StudyConfig = serde_json::from_str(registered)?;
+    if matrix.stage == MatrixStage::A7Pilot {
+        matrix.validate(cfg).map_err(config_error)?;
+        let expected_matrix = expected.matrix.as_mut().expect("registered matrix");
+        expected_matrix.stage = MatrixStage::A7Pilot;
+        expected_matrix
+            .cost_aware
+            .marginal_background_delay_per_protected_second = None;
+        expected_matrix.cost_aware.service_calibration =
+            matrix.cost_aware.service_calibration.clone();
+    }
     if serde_json::to_value(cfg)? != serde_json::to_value(expected)? {
         return Err(config_error(
             "matrix execution requires the preregistered configuration",
@@ -228,9 +243,39 @@ fn validate_execution(cfg: &StudyConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_trial_arm(
+    cfg: &StudyConfig,
+    class: MatrixClass,
+    arm: control::Arm,
+    feasibility_or_reference: bool,
+) -> Result<()> {
+    let stage = matrix_config(cfg)?.stage;
+    if stage == MatrixStage::A7Pilot && (!feasibility_or_reference || class != MatrixClass::W1) {
+        return Err(config_error(
+            "A7 is registered for W1 feasibility and reference trials only",
+        ));
+    }
+    if stage == MatrixStage::A7Pilot
+        && !matches!(
+            arm,
+            control::Arm::Native
+                | control::Arm::Reactive
+                | control::Arm::Oracle
+                | control::Arm::CostAware
+        )
+    {
+        return Err(config_error("arm is outside the A7 feasibility plan"));
+    }
+    if arm == control::Arm::CostAware && stage != MatrixStage::A7Pilot {
+        return Err(config_error("CostAware requires the A7 pilot config"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn shared_gate_has_half_open_boundaries() {
@@ -245,5 +290,38 @@ mod tests {
             }
             assert_eq!(phases.phase(boundary), (i < 4).then_some(i));
         }
+    }
+
+    #[test]
+    fn h3_is_archival_and_a7_requires_a_versioned_service_calibration() {
+        use crate::study::ServiceCalibration;
+
+        let mut cfg = StudyConfig::from_file(Path::new("configs/matrix-h3-pilot.json")).unwrap();
+        assert!(
+            validate_execution(&cfg)
+                .unwrap_err()
+                .detail
+                .contains("historical")
+        );
+        let matrix = cfg.matrix.as_mut().unwrap();
+        matrix.stage = MatrixStage::A7Pilot;
+        matrix
+            .cost_aware
+            .marginal_background_delay_per_protected_second = None;
+        assert!(validate_execution(&cfg).is_err());
+        cfg.matrix.as_mut().unwrap().cost_aware.service_calibration = Some(ServiceCalibration {
+            version: "unit-test".into(),
+            evidence: "synthetic fixture".into(),
+            violation_equivalents_per_overhead_second: 1.0,
+            actuation_seconds: 0.001,
+            action_duration_secs: 0.05,
+            foreground_risk_reduction_fraction: 0.5,
+            background_baseline_miss_probability: 0.1,
+            background_marginal_miss_probability_per_action_second: 1.0,
+            max_background_miss_probability: 0.2,
+        });
+        assert!(validate_execution(&cfg).is_ok());
+        assert!(validate_trial_arm(&cfg, MatrixClass::W1, control::Arm::CostAware, true).is_ok());
+        assert!(validate_trial_arm(&cfg, MatrixClass::W1, control::Arm::CostAware, false).is_err());
     }
 }
