@@ -1,4 +1,4 @@
-use crate::model::{Features, Model, OUTPUTS, Prediction};
+use crate::model::{Features, OUTPUTS, SyntheticMlpCostModel, SyntheticOutput};
 use std::{
     ops::Range,
     sync::{
@@ -9,13 +9,13 @@ use std::{
 };
 
 pub struct Scalar<'a> {
-    model: &'a Model,
+    model: &'a SyntheticMlpCostModel,
     hidden_a: Vec<f32>,
     hidden_b: Vec<f32>,
 }
 
 impl<'a> Scalar<'a> {
-    pub fn new(model: &'a Model) -> Self {
+    pub fn new(model: &'a SyntheticMlpCostModel) -> Self {
         Self {
             model,
             hidden_a: vec![0.0; model.layers[0].outputs],
@@ -23,7 +23,7 @@ impl<'a> Scalar<'a> {
         }
     }
 
-    pub fn infer(&mut self, features: &Features) -> Prediction {
+    pub fn infer(&mut self, features: &Features) -> SyntheticOutput {
         let mut out = [0.0; OUTPUTS];
         self.model.layers[0].forward_rows(features, 0, &mut self.hidden_a);
         self.model.layers[1].forward_rows(&self.hidden_a, 0, &mut self.hidden_b);
@@ -38,7 +38,7 @@ pub struct Parallel {
 }
 
 struct Shared {
-    model: Arc<Model>,
+    model: Arc<SyntheticMlpCostModel>,
     input: RwLock<Vec<f32>>,
     chunks: Vec<Mutex<Vec<f32>>>,
 }
@@ -50,7 +50,7 @@ struct Worker {
 }
 
 impl Parallel {
-    pub fn new(model: Arc<Model>, threads: usize) -> Result<Self, String> {
+    pub fn new(model: Arc<SyntheticMlpCostModel>, threads: usize) -> Result<Self, String> {
         let input_len = model.layers.iter().map(|layer| layer.inputs).max().unwrap();
         let output_len = model
             .layers
@@ -93,7 +93,7 @@ impl Parallel {
         Ok(parallel)
     }
 
-    pub fn infer(&mut self, features: &Features) -> Result<Prediction, String> {
+    pub fn infer(&mut self, features: &Features) -> Result<SyntheticOutput, String> {
         self.shared.input.write().unwrap()[..features.len()].copy_from_slice(features);
         for (index, layer) in self.shared.model.layers.iter().enumerate() {
             for worker in &self.workers {
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn parallel_rows_match_scalar_for_uneven_chunks_and_consecutive_inputs() {
-        let model = Arc::new(Model::new(71, 42));
+        let model = Arc::new(SyntheticMlpCostModel::new(71, 42));
         let mut scalar = Scalar::new(&model);
         let mut parallel = Parallel::new(Arc::clone(&model), 4).unwrap();
         for input in features(42) {

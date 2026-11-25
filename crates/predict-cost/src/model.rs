@@ -2,13 +2,13 @@ pub const INPUTS: usize = 64;
 pub const OUTPUTS: usize = 4;
 pub const EPSILON: f32 = 1e-3;
 pub type Features = [f32; INPUTS];
-pub type Prediction = [f32; OUTPUTS];
+pub type SyntheticOutput = [f32; OUTPUTS];
 
-pub struct Model {
+pub struct SyntheticMlpCostModel {
     pub layers: [Layer; 3],
 }
 
-impl Model {
+impl SyntheticMlpCostModel {
     pub fn new(width: usize, seed: u64) -> Self {
         let mut random = Random(seed);
         Self {
@@ -110,7 +110,11 @@ mod tests {
 
     #[test]
     fn weights_and_features_are_seed_deterministic() {
-        let (a, b, c) = (Model::new(71, 42), Model::new(71, 42), Model::new(71, 43));
+        let (a, b, c) = (
+            SyntheticMlpCostModel::new(71, 42),
+            SyntheticMlpCostModel::new(71, 42),
+            SyntheticMlpCostModel::new(71, 43),
+        );
         for ((a, b), c) in a.layers.iter().zip(&b.layers).zip(&c.layers) {
             assert_eq!(a.parameters, b.parameters);
             assert_ne!(a.parameters, c.parameters);
