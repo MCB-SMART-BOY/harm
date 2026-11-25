@@ -1,4 +1,7 @@
 use super::{
+    leadtime::{
+        DeclaredPolicy, Delivery, ENVELOPE_NS, HOLD_NS, Intent, delivery_latency_percentiles,
+    },
     score::Completion,
     workload::{Event, Events, OBSERVATION_WINDOW_NS},
     *,
@@ -12,6 +15,7 @@ use crate::{
     predict::WorkerCompletion,
     study::cost_aware::{CostAwareDecision, CostAwareState, ObservedDecisionInput},
 };
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, io::BufRead, path::Path, time::Instant};
 
@@ -24,6 +28,10 @@ pub(super) enum Arm {
     Reactive,
     Oracle,
     CostAware,
+    #[serde(rename = "declared-250")]
+    Declared250,
+    #[serde(rename = "declared-500")]
+    Declared500,
 }
 
 impl Arm {
@@ -35,7 +43,17 @@ impl Arm {
             "reactive" => Ok(Self::Reactive),
             "oracle" => Ok(Self::Oracle),
             "cost-aware" => Ok(Self::CostAware),
+            "declared-250" => Ok(Self::Declared250),
+            "declared-500" => Ok(Self::Declared500),
             _ => Err(config_error(format!("unsupported matrix arm {name}"))),
+        }
+    }
+
+    pub fn declared_lead_ns(self) -> Option<u64> {
+        match self {
+            Self::Declared250 => Some(250 * MS),
+            Self::Declared500 => Some(500 * MS),
+            _ => None,
         }
     }
 }
@@ -57,6 +75,14 @@ pub(super) struct Oracle {
 }
 
 impl Oracle {
+    pub fn randomized(phases: Phases) -> Self {
+        let bytes = phases.boundaries.map(u64::to_le_bytes).concat();
+        Self {
+            phases,
+            hash: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
     pub fn load(path: &Path, class: MatrixClass, seed: u64, expected: Phases) -> Result<Self> {
         let bytes = fs::read(path).map_err(|e| {
             MatrixError::new(
@@ -276,6 +302,8 @@ pub(super) struct Tick {
     error: Option<String>,
     forecast_ns: Option<u64>,
     following_window_outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_onset_target_ns: Option<u64>,
 }
 
 const EXPIRED_PROPOSAL: &str = "expired_proposal";
@@ -295,6 +323,7 @@ pub(super) struct ControlRun {
     pub apply_failed: bool,
     pub restored: bool,
     pub began_at_ns: Option<u64>,
+    pub deliveries: Vec<Delivery>,
     late_worker_completion_after_last_tick: Option<WorkerCompletion>,
     predictor_in_flight_at_trial_end: Option<u64>,
 }
@@ -302,7 +331,8 @@ pub(super) struct ControlRun {
 pub(super) struct Controller<'a> {
     pub cfg: &'a StudyConfig,
     pub scope: &'a DelegatedScope,
-    pub phases: Phases,
+    pub legacy_observation_phases: Option<Phases>,
+    pub total_ns: u64,
     pub class: MatrixClass,
     pub arm: Arm,
     pub oracle: Option<&'a Oracle>,
@@ -310,7 +340,12 @@ pub(super) struct Controller<'a> {
 }
 
 impl Controller<'_> {
-    pub fn run(&self, gate: u64, events: &Events) -> Result<ControlRun> {
+    pub fn run(
+        &self,
+        gate: u64,
+        events: &Events,
+        mut declared: Option<DeclaredPolicy>,
+    ) -> Result<ControlRun> {
         let paths = self.scope.workload().to_owned();
         let mut actuator = self
             .scope
@@ -323,7 +358,7 @@ impl Controller<'_> {
         let mut cost_aware = (self.arm == Arm::CostAware)
             .then(|| CostAwareState::new(&matrix.cost_aware))
             .transpose()?;
-        for scheduled_ns in (0..self.phases.total()).step_by(interval as usize) {
+        for scheduled_ns in (0..self.total_ns).step_by(interval as usize) {
             sleep_until(gate + scheduled_ns);
             let decision_start = now();
             result.began_at_ns.get_or_insert(decision_start);
@@ -335,10 +370,20 @@ impl Controller<'_> {
                 let observed_at = crate::monotonic_seconds();
                 let capacity = live.capacity;
                 let evictions = live.capacity_evictions;
-                if matrix.stage == MatrixStage::A7Pilot {
-                    // A7 W1 uses the actual observation cut, with no phase or phase age.
+                if let Some(phases) = self.legacy_observation_phases {
+                    let recent: Vec<_> = live
+                        .iter()
+                        .filter(|event| event.observed_ns <= scheduled_ns)
+                        .collect();
+                    drop(live);
+                    let observation = observe(self.class, matrix, phases, scheduled_ns, &recent);
+                    (observation, observed_at, capacity, evictions)
+                } else {
+                    // A6 and A7 use the actual observation cut, with no phase or phase age.
                     let elapsed = observation_cut_ns - gate;
-                    risk = live.w1_risk_window(elapsed);
+                    if self.arm == Arm::CostAware {
+                        risk = live.w1_risk_window(elapsed);
+                    }
                     let samples = live.iter().len();
                     let mut latencies: Vec<_> =
                         if live.covers_since(elapsed.saturating_sub(OBSERVATION_WINDOW_NS)) {
@@ -366,22 +411,14 @@ impl Controller<'_> {
                         capacity,
                         evictions,
                     )
-                } else {
-                    let recent: Vec<_> = live
-                        .iter()
-                        .filter(|event| event.observed_ns <= scheduled_ns)
-                        .collect();
-                    drop(live);
-                    let observation =
-                        observe(self.class, matrix, self.phases, scheduled_ns, &recent);
-                    (observation, observed_at, capacity, evictions)
                 }
             };
             let observed = now();
             let mut forecast_ns = None;
             let mut cost_aware_decision = None;
             let mut expires_at_seconds = None;
-            let tick_expires_ns = gate + scheduled_ns + interval;
+            let mut tick_expires_ns = gate + scheduled_ns + interval;
+            let mut declared_onset_target_ns = None;
             let proposal = match self.arm {
                 Arm::Native => None,
                 Arm::StaticLow => Some((self.cfg.static_weight, Source::Assumed)),
@@ -413,6 +450,18 @@ impl Controller<'_> {
                     });
                     forecast_ns = Some(now() - entry);
                     Some((weight, Source::StudyOracle))
+                }
+                Arm::Declared250 | Arm::Declared500 => {
+                    let decision = declared
+                        .as_mut()
+                        .expect("declared receiver")
+                        .poll(effective_weight, &mut result.deliveries)
+                        .map_err(|error| MatrixError::new(VoidReason::MissingIntent, error))?;
+                    declared_onset_target_ns = decision.onset_target_ns;
+                    if let Some(deadline) = decision.apply_before_ns {
+                        tick_expires_ns = tick_expires_ns.min(deadline);
+                    }
+                    Some((decision.weight, decision.source))
                 }
                 Arm::CostAware => {
                     let signal = reactive_bad(self.class, self.cfg, &observation);
@@ -503,9 +552,10 @@ impl Controller<'_> {
                 error,
                 forecast_ns,
                 following_window_outcome: None,
+                declared_onset_target_ns,
             });
         }
-        sleep_until(gate + self.phases.total());
+        sleep_until(gate + self.total_ns);
         result.restored = actuator.restore_all().is_ok();
         if let Some(online) = &mut cost_aware {
             result.late_worker_completion_after_last_tick = online.reap_late();
@@ -620,6 +670,7 @@ pub(super) fn action_voids(
     cfg: &StudyConfig,
     actions: &[Effective],
     static_low: &[u32],
+    total_ns: u64,
 ) -> Vec<VoidReason> {
     let mut voids = Vec::new();
     if actions
@@ -631,7 +682,7 @@ pub(super) fn action_voids(
     let changes: Vec<_> = actions
         .iter()
         .copied()
-        .filter(|a| a.before != a.readback && a.elapsed_ns < phases.total())
+        .filter(|a| a.before != a.readback && a.elapsed_ns < total_ns)
         .collect();
     if changes.len() != actions.len() {
         voids.push(VoidReason::MissingVerifiedApply);
@@ -685,6 +736,152 @@ pub(super) struct TickTiming {
 }
 
 impl ControlRun {
+    pub fn leadtime_evidence(
+        &self,
+        arm: Arm,
+        phases: Phases,
+        gate: u64,
+        cfg: &StudyConfig,
+        streams: (&[Event], &[Intent]),
+    ) -> (Value, Vec<VoidReason>) {
+        let (events, sent) = streams;
+        let mut reasons = Vec::new();
+        let targets = PROTECTED.map(|p| gate + phases.start(p));
+        let mut latency_samples = Vec::new();
+        let mut matched_deliveries = 0;
+        let mut rows = Vec::new();
+        for (phase, target) in PROTECTED.into_iter().zip(targets) {
+            let onset = events
+                .iter()
+                .find(|event| event.phase == phase)
+                .map(|event| gate + event.release_ns);
+            if onset.is_none() {
+                reasons.push(VoidReason::MissingLeadTimeEvidence);
+            }
+            let mut accepted = None;
+            let mut send_target_ns = None;
+            let mut applied = None;
+            let mut refused = false;
+            if let Some(lead) = arm.declared_lead_ns() {
+                let due = target - lead;
+                send_target_ns = Some(due);
+                let matching: Vec<_> = self
+                    .deliveries
+                    .iter()
+                    .filter(|row| row.intent.onset_target_ns == target)
+                    .collect();
+                matched_deliveries += usize::from(!matching.is_empty());
+                let send = sent.iter().find(|intent| intent.onset_target_ns == target);
+                match (send, matching.first()) {
+                    (Some(intent), Some(row)) if row.intent == *intent => {
+                        if row.disposition == "late" || row.received_ns >= target {
+                            reasons.push(VoidReason::LateIntent);
+                        } else if row.disposition != "accepted"
+                            || !(due..=row.received_ns).contains(&intent.sent_ns)
+                        {
+                            reasons.push(VoidReason::MissingLeadTimeEvidence);
+                        } else {
+                            accepted = Some(*row);
+                            latency_samples.push(row.received_ns - intent.sent_ns);
+                        }
+                    }
+                    _ => reasons.push(VoidReason::MissingIntent),
+                }
+                if let Some(delivery) = accepted {
+                    for tick in self
+                        .ticks
+                        .iter()
+                        .filter(|tick| tick.declared_onset_target_ns == Some(target))
+                    {
+                        refused |= tick.outcome == EXPIRED_PROPOSAL;
+                        if let Some(change) = tick.applied {
+                            let at = gate + change.elapsed_ns;
+                            if tick.proposed_source != Some(Source::Predicted)
+                                || at < delivery.received_ns
+                            {
+                                reasons.push(VoidReason::MissingLeadTimeEvidence);
+                            } else if at >= target {
+                                reasons.push(VoidReason::StaleAppliedDecision);
+                            } else {
+                                applied = Some(at);
+                            }
+                        }
+                    }
+                    if applied.is_none() && !refused {
+                        reasons.push(VoidReason::MissingDeclaredTransition);
+                    }
+                }
+            } else if arm == Arm::Oracle {
+                let start = target - seconds_ns(cfg.oracle_horizon_secs);
+                applied = self
+                    .actions
+                    .iter()
+                    .filter(|change| change.readback == cfg.protected_weight)
+                    .map(|change| gate + change.elapsed_ns)
+                    .find(|at| (start..target).contains(at));
+            }
+            if applied.is_some() && arm.declared_lead_ns().is_some() {
+                let release_from = target + HOLD_NS;
+                let release_by = if phase == PROTECTED[0] {
+                    targets[1] - arm.declared_lead_ns().expect("declared lead")
+                } else {
+                    gate + ENVELOPE_NS
+                };
+                // Near the end of the envelope, there may be no tick at or after
+                // the end of the lease. Scope restoration still runs at exit.
+                let interval = cfg.control_tick_ms * MS;
+                if (release_from - gate).div_ceil(interval) < (release_by - gate).div_ceil(interval)
+                {
+                    let in_window = |tick: &&Tick| {
+                        (release_from..release_by).contains(&(gate + tick.decision_end_ns))
+                    };
+                    let released = self.ticks.iter().filter(in_window).any(|tick| {
+                        tick.applied.is_some_and(|a| a.readback == cfg.free_weight)
+                            || (tick.proposed_weight == Some(cfg.free_weight)
+                                && tick.outcome == EXPIRED_PROPOSAL)
+                    });
+                    if !released {
+                        reasons.push(VoidReason::MissingDeclaredTransition);
+                    }
+                }
+            }
+            rows.push(json!({
+                "phase": NAMES[phase], "onset_target_ns": target, "observed_onset_ns": onset,
+                "onset_source": Source::Observed, "send_target_ns": send_target_ns,
+                "accepted_intent": accepted, "verified_protection_ns": applied,
+                "warning_lead_ns": onset.zip(accepted).and_then(|(start, row)| start.checked_sub(row.received_ns)),
+                "effective_lead_ns": onset.zip(applied).and_then(|(start, write)| start.checked_sub(write)),
+                "expired_protection_proposal": arm.declared_lead_ns().map(|_| refused),
+            }));
+        }
+        let alarms = arm
+            .declared_lead_ns()
+            .map(|_| self.deliveries.len() - matched_deliveries);
+        if alarms.is_some_and(|count| count != 0) {
+            reasons.push(VoidReason::FalseIntent);
+        }
+        let actions: Vec<_> = self
+            .ticks
+            .iter()
+            .filter_map(|tick| {
+                let change = tick.applied?;
+                Some(json!({
+                    "verified_ns": gate + change.elapsed_ns,
+                    "weight": change.readback, "source": tick.proposed_source,
+                    "declared_onset_target_ns": tick.declared_onset_target_ns,
+                }))
+            })
+            .collect();
+        (
+            json!({
+                "gate_ns": gate, "phases": rows, "sent": sent, "sent_source": arm.declared_lead_ns().map(|_| Source::Observed),
+                "deliveries": self.deliveries, "false_alarm_count": alarms,
+                "delivery_latency": delivery_latency_percentiles(latency_samples), "verified_actions": actions,
+            }),
+            reasons,
+        )
+    }
+
     pub fn attribute_following_windows(
         &mut self,
         class: MatrixClass,
@@ -707,9 +904,9 @@ impl ControlRun {
         }
     }
 
-    pub fn tick_timing(&self, phases: Phases, cfg: &StudyConfig) -> Option<TickTiming> {
+    pub fn tick_timing(&self, total_ns: u64, cfg: &StudyConfig) -> Option<TickTiming> {
         let interval = cfg.control_tick_ms * MS;
-        if self.ticks.len() as u64 != phases.total() / interval {
+        if self.ticks.len() as u64 != total_ns.div_ceil(interval) {
             return None;
         }
         let first_lateness_ns = self.ticks.first()?.tick_lateness_ns;
@@ -762,8 +959,9 @@ impl ControlRun {
         arm: Arm,
         phases: Phases,
         cfg: &StudyConfig,
+        total_ns: u64,
     ) -> (Option<Overhead>, Vec<VoidReason>) {
-        let (overhead, mut reasons) = self.metrics(audit, phases.total(), cfg.control_tick_ms * MS);
+        let (overhead, mut reasons) = self.metrics(audit, total_ns, cfg.control_tick_ms * MS);
         if !self.has_initial_apply(arm, cfg) {
             reasons.push(VoidReason::MissingVerifiedApply);
         }
@@ -773,6 +971,7 @@ impl ControlRun {
             cfg,
             &self.actions,
             &[cfg.static_weight],
+            total_ns,
         ));
         (overhead, reasons)
     }
@@ -787,7 +986,7 @@ impl ControlRun {
         if !self.restored {
             reasons.push(VoidReason::FailedRestoration);
         }
-        if self.ticks.len() as u64 != total / interval {
+        if self.ticks.len() as u64 != total.div_ceil(interval) {
             reasons.push(VoidReason::MissingTelemetry);
         }
         let nonmonotonic = self.ticks.iter().enumerate().any(|(i, tick)| {
@@ -954,8 +1153,8 @@ impl ControlRun {
         })
     }
 
-    pub fn expiry_metrics(&self, phases: Phases, cfg: &StudyConfig) -> Option<ExpiryMetrics> {
-        if self.ticks.len() as u64 != phases.total() / (cfg.control_tick_ms * MS) {
+    pub fn expiry_metrics(&self, total_ns: u64, cfg: &StudyConfig) -> Option<ExpiryMetrics> {
+        if self.ticks.len() as u64 != total_ns.div_ceil(cfg.control_tick_ms * MS) {
             return None;
         }
         let mut counts = ExpiryMetrics {
@@ -979,7 +1178,12 @@ impl ControlRun {
         let expected = match arm {
             Arm::Native => return self.actions.is_empty(),
             Arm::StaticLow => cfg.static_weight,
-            Arm::StaticHigh | Arm::Oracle | Arm::Reactive | Arm::CostAware => cfg.free_weight,
+            Arm::StaticHigh
+            | Arm::Oracle
+            | Arm::Reactive
+            | Arm::CostAware
+            | Arm::Declared250
+            | Arm::Declared500 => cfg.free_weight,
         };
         self.actions
             .first()
@@ -994,14 +1198,15 @@ mod tests {
     #[test]
     fn refused_expiry_counts_without_satisfying_any_effective_sequence_requirements() {
         let (cfg, phases, control, audit) = oracle_control_fixture(1, 6001);
-        let (overhead, reasons) = control.validate(&audit, Arm::Oracle, phases, &cfg);
+        let (overhead, reasons) =
+            control.validate(&audit, Arm::Oracle, phases, &cfg, phases.total());
         assert!(reasons.is_empty());
         assert_eq!(overhead.unwrap().verified_actions, 4);
         assert_eq!(weights(&control.actions), [1000, 20, 1000, 20]);
         assert_eq!(control.ticks[70].outcome, EXPIRED_PROPOSAL);
         assert_eq!(control.ticks[70].effective_weight, 1000);
         assert!(control.ticks[70].applied.is_none());
-        let counts = control.expiry_metrics(phases, &cfg).unwrap();
+        let counts = control.expiry_metrics(phases.total(), &cfg).unwrap();
         assert_eq!(counts.expired_proposal_count, 1);
         assert_eq!(counts.weight_change_proposal_count, 5);
         assert_eq!(counts.forecasts_with_expired_proposal_count, 1);
@@ -1009,8 +1214,15 @@ mod tests {
         let mut missing_burst_apply = control.actions;
         missing_burst_apply.remove(1);
         assert!(
-            action_voids(Arm::Oracle, phases, &cfg, &missing_burst_apply, &[20])
-                .contains(&VoidReason::MissingOracleTransition)
+            action_voids(
+                Arm::Oracle,
+                phases,
+                &cfg,
+                &missing_burst_apply,
+                &[20],
+                phases.total()
+            )
+            .contains(&VoidReason::MissingOracleTransition)
         );
         fs::remove_file(audit).unwrap();
     }
@@ -1021,7 +1233,9 @@ mod tests {
         // satisfies the sequence check, but the verified write is stale.
         let (cfg, phases, control, audit) = oracle_control_fixture(1, 6050);
         assert_eq!(
-            control.validate(&audit, Arm::Oracle, phases, &cfg).1,
+            control
+                .validate(&audit, Arm::Oracle, phases, &cfg, phases.total())
+                .1,
             [VoidReason::StaleAppliedDecision]
         );
         fs::remove_file(audit).unwrap();
@@ -1032,7 +1246,9 @@ mod tests {
         // First verified apply from a fresh tick, but later than the initial window.
         let (cfg, phases, control, audit) = oracle_control_fixture(51, 6001);
         assert_eq!(
-            control.validate(&audit, Arm::Oracle, phases, &cfg).1,
+            control
+                .validate(&audit, Arm::Oracle, phases, &cfg, phases.total())
+                .1,
             [VoidReason::MissingVerifiedApply]
         );
         fs::remove_file(audit).unwrap();
@@ -1095,6 +1311,7 @@ mod tests {
                 error: None,
                 forecast_ns: Some(0),
                 following_window_outcome: None,
+                declared_onset_target_ns: None,
             };
             if weight_change_proposed {
                 let attempt = if let Some(at) = applied_ms {
@@ -1204,19 +1421,26 @@ mod tests {
             change(6001, 20, 1000),
             change(9501, 1000, 20),
         ];
-        assert!(action_voids(Arm::Oracle, phases, &cfg, &valid, &[20]).is_empty());
-        let reasons = action_voids(Arm::Oracle, phases, &cfg, &[change(5, 100, 20)], &[20]);
+        assert!(action_voids(Arm::Oracle, phases, &cfg, &valid, &[20], phases.total()).is_empty());
+        let reasons = action_voids(
+            Arm::Oracle,
+            phases,
+            &cfg,
+            &[change(5, 100, 20)],
+            &[20],
+            phases.total(),
+        );
         assert!(reasons.contains(&VoidReason::StaticLowSequence));
         assert!(reasons.contains(&VoidReason::MissingDynamicWeights));
         let mut invalid = valid;
         invalid[3].elapsed_ns = 10 * SECOND;
         assert!(
-            action_voids(Arm::Oracle, phases, &cfg, &invalid, &[20])
+            action_voids(Arm::Oracle, phases, &cfg, &invalid, &[20], phases.total())
                 .contains(&VoidReason::MissingOracleTransition)
         );
         invalid[3].elapsed_ns = MS;
         assert!(
-            action_voids(Arm::Oracle, phases, &cfg, &invalid, &[20])
+            action_voids(Arm::Oracle, phases, &cfg, &invalid, &[20], phases.total())
                 .contains(&VoidReason::NonMonotonicTiming)
         );
         assert!(

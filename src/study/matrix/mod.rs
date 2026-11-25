@@ -1,5 +1,5 @@
 mod control;
-pub mod leadtime;
+mod leadtime;
 mod score;
 mod session;
 mod trial;
@@ -97,6 +97,11 @@ pub enum VoidReason {
     ScopeCleanup,
     NoHeadroom,
     StaleAppliedDecision,
+    MissingIntent,
+    LateIntent,
+    FalseIntent,
+    MissingLeadTimeEvidence,
+    MissingDeclaredTransition,
 }
 
 #[derive(Debug)]
@@ -185,6 +190,17 @@ struct Phases {
 }
 
 impl Phases {
+    fn for_trial(cfg: &StudyConfig, seed: u64) -> Result<Self> {
+        if matrix_config(cfg)?.stage.is_a6() {
+            let schedule = leadtime::A6Schedule::from_seed(seed);
+            let [a, b, c, d] = schedule.starts_ms();
+            return Ok(Self {
+                boundaries: [a, b, c, d, schedule.total_ms()].map(|ms| ms * MS),
+            });
+        }
+        Ok(Self::new(cfg.phase_durations_secs))
+    }
+
     fn new(durations: [f64; 4]) -> Self {
         let mut boundaries = [0; 5];
         for (i, secs) in durations.into_iter().enumerate() {
@@ -223,6 +239,8 @@ fn validate_execution(cfg: &StudyConfig) -> Result<()> {
         MatrixStage::A7Pilot => {
             include_str!("../../../configs/matrix-h3-pilot.json")
         }
+        MatrixStage::A6Pilot => include_str!("../../../configs/matrix-a6-pilot.json"),
+        MatrixStage::A6Full => include_str!("../../../configs/matrix-a6-full.json"),
         MatrixStage::Full => include_str!("../../../configs/matrix-full.json"),
     };
     let mut expected: StudyConfig = serde_json::from_str(registered)?;
@@ -251,6 +269,15 @@ fn validate_trial_arm(
     feasibility_or_reference: bool,
 ) -> Result<()> {
     let stage = matrix_config(cfg)?.stage;
+    if stage.is_a6()
+        && (class != MatrixClass::W1
+            || matches!(arm, control::Arm::StaticHigh | control::Arm::CostAware))
+    {
+        return Err(config_error("arm or workload is outside the A6 W1 plan"));
+    }
+    if arm.declared_lead_ns().is_some() && !stage.is_a6() {
+        return Err(config_error("declared intent arms require an A6 plan"));
+    }
     if stage == MatrixStage::A7Pilot && (!feasibility_or_reference || class != MatrixClass::W1) {
         return Err(config_error(
             "A7 is registered for W1 feasibility and reference trials only",

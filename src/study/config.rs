@@ -146,7 +146,19 @@ pub enum MatrixStage {
     Pilot,
     H3Pilot,
     A7Pilot,
+    A6Pilot,
+    A6Full,
     Full,
+}
+
+impl MatrixStage {
+    pub(super) fn is_a6(self) -> bool {
+        matches!(self, Self::A6Pilot | Self::A6Full)
+    }
+
+    pub(super) fn phase_blind(self) -> bool {
+        self.is_a6() || self == Self::A7Pilot
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,8 +212,11 @@ pub struct MatrixTrainingWorkload {
 impl MatrixConfig {
     pub(super) fn validate(&self, cfg: &StudyConfig) -> Result<(), String> {
         let sessions = match self.stage {
-            MatrixStage::Pilot | MatrixStage::H3Pilot | MatrixStage::A7Pilot => 1,
-            MatrixStage::Full => 2,
+            MatrixStage::Pilot
+            | MatrixStage::H3Pilot
+            | MatrixStage::A7Pilot
+            | MatrixStage::A6Pilot => 1,
+            MatrixStage::Full | MatrixStage::A6Full => 2,
         };
         if self.seeds_per_session == 0
             || self.seeds_per_session.checked_mul(sessions) != Some(cfg.seeds.len())
@@ -228,6 +243,18 @@ impl MatrixConfig {
             MatrixStage::H3Pilot | MatrixStage::A7Pilot => {
                 cfg.arms == ["native", "reactive", "oracle", "cost-aware"]
                     && self.deferred_arms.is_empty()
+            }
+            MatrixStage::A6Pilot | MatrixStage::A6Full => {
+                cfg.arms
+                    == [
+                        "native",
+                        "static-low",
+                        "reactive",
+                        "oracle",
+                        "declared-250",
+                        "declared-500",
+                    ]
+                    && self.deferred_arms == ["cost-aware"]
             }
         };
         if !stage_arms_ok {
@@ -558,6 +585,8 @@ mod tests {
             ("matrix-pilot.json", MatrixStage::Pilot, 6, 1),
             ("matrix-h3-pilot.json", MatrixStage::H3Pilot, 6, 1),
             ("matrix-full.json", MatrixStage::Full, 21, 2),
+            ("matrix-a6-pilot.json", MatrixStage::A6Pilot, 6, 1),
+            ("matrix-a6-full.json", MatrixStage::A6Full, 21, 2),
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("configs")

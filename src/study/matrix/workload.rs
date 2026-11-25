@@ -445,6 +445,7 @@ fn prepare_gpu(
 pub(super) struct Foreground {
     pub events: Arc<Events>,
     pub adapter: Option<String>,
+    pub sent_intents: Arc<Mutex<Vec<super::leadtime::Intent>>>,
     start: Option<mpsc::Sender<u64>>,
     thread: Option<JoinHandle<Result<()>>>,
 }
@@ -456,6 +457,7 @@ impl Foreground {
         phases: Phases,
         seed: u64,
         tick_interval_ns: u64,
+        intent: Option<(super::leadtime::IntentSender, u64)>,
     ) -> Result<Self> {
         let cpu = matches!(class, MatrixClass::W1 | MatrixClass::W2);
         let events = Arc::new(Events {
@@ -473,7 +475,7 @@ impl Foreground {
                 }
                 // Legacy observers use their scheduled cutoff. Keep the
                 // preceding window while their current tick is still fresh.
-                + if matrix.stage == MatrixStage::A7Pilot {
+                + if matrix.stage.phase_blind() {
                     0
                 } else {
                     tick_interval_ns
@@ -486,6 +488,8 @@ impl Foreground {
         let (start, gate) = mpsc::channel();
         let (ready, setup) = mpsc::channel();
         let matrix = matrix.clone();
+        let sent_intents = Arc::new(Mutex::new(Vec::new()));
+        let sent_log = Arc::clone(&sent_intents);
         let thread = thread::Builder::new()
             .name("matrix-foreground".into())
             .spawn(move || {
@@ -544,7 +548,12 @@ impl Foreground {
                             .map_err(|e| MatrixError::new(VoidReason::Crash, e))?;
                         ready.send(Ok(adapter)).ok();
                         let result = gate.recv().ok().map_or(Ok(()), |at| {
-                            run_ping(&mut client, class, phases, at, &output)
+                            let mut a6 = matrix.stage.is_a6().then(|| PingDemand {
+                                intent,
+                                sent: &sent_log,
+                                next_notice: 0,
+                            });
+                            run_ping(&mut client, class, phases, at, &output, a6.as_mut())
                         });
                         drop(client);
                         let echo_result = join(echo);
@@ -567,6 +576,7 @@ impl Foreground {
         let mut foreground = Self {
             events,
             adapter: None,
+            sent_intents,
             start: Some(start),
             thread: Some(thread),
         };
@@ -604,23 +614,72 @@ fn join<T>(thread: JoinHandle<Result<T>>) -> Result<T> {
         .map_err(|_| MatrixError::new(VoidReason::Crash, "workload thread panicked"))?
 }
 
+struct PingDemand<'a> {
+    intent: Option<(super::leadtime::IntentSender, u64)>,
+    sent: &'a Mutex<Vec<super::leadtime::Intent>>,
+    next_notice: usize,
+}
+
+impl PingDemand<'_> {
+    fn send_due(&mut self, phases: Phases, gate: u64, at: u64) -> Result<Option<u64>> {
+        let Some((sender, lead_ns)) = &self.intent else {
+            return Ok(None);
+        };
+        Ok(loop {
+            let Some(&phase) = PROTECTED.get(self.next_notice) else {
+                break None;
+            };
+            let target = gate + phases.start(phase);
+            let due = target - lead_ns;
+            if at < due {
+                break Some(due);
+            }
+            let sent = sender.declare(target).map_err(|error| {
+                MatrixError::new(VoidReason::MissingIntent, format!("intent send: {error}"))
+            })?;
+            self.sent.lock().expect("send log").push(sent);
+            self.next_notice += 1;
+        })
+    }
+}
+
 fn run_ping(
     client: &mut UnixStream,
     class: MatrixClass,
     phases: Phases,
     at: u64,
     events: &EventPublisher,
+    mut demand: Option<&mut PingDemand<'_>>,
 ) -> Result<()> {
     sleep_until(at);
+    let mut paced_release = at;
     loop {
-        let release = now() - at;
+        let timestamp = now();
+        let release = timestamp - at;
         let Some(phase) = phases.phase(release) else {
             return Ok(());
         };
+        if let Some(demand) = &mut demand {
+            let next_notice = demand.send_due(phases, at, timestamp)?;
+            if !PROTECTED.contains(&phase) && timestamp < paced_release {
+                let next = paced_release.min(at + phases.end(phase));
+                sleep_until(next_notice.map_or(next, |notice| notice.min(next)));
+                continue;
+            }
+            // Re-read the release clock after workload-side transmission.
+            if phases.phase(now() - at) != Some(phase) {
+                continue;
+            }
+        }
         if !class.active(phase) {
             sleep_until(at + phases.end(phase));
             continue;
         }
+        let release = now() - at;
+        let Some(phase) = phases.phase(release) else {
+            return Ok(());
+        };
+        paced_release = at + release + MS;
         client.write_all(&[1])?;
         let mut ack = [0];
         client.read_exact(&mut ack)?;
