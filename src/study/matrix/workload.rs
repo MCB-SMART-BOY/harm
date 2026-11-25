@@ -1,7 +1,9 @@
 use super::*;
+use crate::{Seconds, study::cost_aware::ObservedRiskWindow};
 use gpu_probe::{Compute, Inference, Training};
 use rustix::process::{getpriority_process, setpriority_process};
 use std::{
+    collections::VecDeque,
     hint::black_box,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
@@ -286,7 +288,107 @@ impl Event {
     }
 }
 
-pub(super) type Events = Arc<Mutex<Vec<Event>>>;
+pub(super) const OBSERVATION_WINDOW_NS: u64 = 200 * MS;
+const LIVE_CAPACITY: usize = 65_536;
+
+pub(super) struct Events {
+    pub raw: Mutex<Vec<Event>>,
+    pub live: Mutex<LiveEvents>,
+}
+
+/// Only the publisher reads raw events during the trial. The controller uses
+/// this bounded ring and its rolling violation counter.
+pub(super) struct LiveEvents {
+    recent: VecDeque<(Event, bool)>,
+    pub capacity: usize,
+    pub capacity_evictions: u64,
+    pub last_evicted_ns: Option<u64>,
+    pub violations: usize,
+}
+
+impl LiveEvents {
+    fn new(capacity: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(capacity),
+            capacity,
+            capacity_evictions: 0,
+            last_evicted_ns: None,
+            violations: 0,
+        }
+    }
+
+    pub fn trim(&mut self, from: u64) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|(event, _)| event.observed_ns < from)
+        {
+            self.remove_oldest();
+        }
+    }
+
+    fn remove_oldest(&mut self) -> Event {
+        let (event, violation) = self.recent.pop_front().expect("nonempty ring");
+        self.violations -= usize::from(violation);
+        event
+    }
+
+    fn push(&mut self, event: Event, violation: bool, retention_ns: u64) {
+        self.trim(event.observed_ns.saturating_sub(retention_ns));
+        if self.recent.len() == self.capacity {
+            self.last_evicted_ns = Some(self.remove_oldest().observed_ns);
+            self.capacity_evictions += 1;
+        }
+        self.recent.push_back((event, violation));
+        self.violations += usize::from(violation);
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = Event> + ExactSizeIterator + '_ {
+        self.recent.iter().map(|&(event, _)| event)
+    }
+
+    pub fn covers_since(&self, from: u64) -> bool {
+        self.last_evicted_ns.is_none_or(|evicted| evicted < from)
+    }
+
+    /// A7's W1 snapshot. Trimming visits at most `capacity` entries and the
+    /// estimator reads only the maintained counters.
+    pub fn w1_risk_window(&mut self, elapsed_ns: u64) -> Option<ObservedRiskWindow> {
+        let from = elapsed_ns.saturating_sub(OBSERVATION_WINDOW_NS);
+        self.trim(from);
+        (elapsed_ns >= OBSERVATION_WINDOW_NS && !self.recent.is_empty() && self.covers_since(from))
+            .then(|| ObservedRiskWindow {
+                opportunities: self.recent.len(),
+                violations: self.violations,
+                duration: Seconds::new(OBSERVATION_WINDOW_NS as f64 / SECOND as f64).unwrap(),
+            })
+    }
+}
+
+struct EventPublisher {
+    events: Arc<Events>,
+    class: MatrixClass,
+    retention_ns: u64,
+    latency_slo_ns: u128,
+}
+
+impl EventPublisher {
+    fn publish(&self, event: Event) {
+        let violation = match self.class {
+            MatrixClass::W1 | MatrixClass::W2 => {
+                event.latency().is_some_and(|ns| ns > self.latency_slo_ns)
+            }
+            MatrixClass::W3 => event.miss(),
+            MatrixClass::W4 => false,
+        };
+        self.events.live.lock().expect("live events lock").push(
+            event,
+            violation,
+            self.retention_ns,
+        );
+        self.events.raw.lock().expect("raw events lock").push(event);
+    }
+}
 
 enum ForegroundJob {
     Ping,
@@ -341,7 +443,7 @@ fn prepare_gpu(
 }
 
 pub(super) struct Foreground {
-    pub events: Events,
+    pub events: Arc<Events>,
     pub adapter: Option<String>,
     start: Option<mpsc::Sender<u64>>,
     thread: Option<JoinHandle<Result<()>>>,
@@ -353,10 +455,34 @@ impl Foreground {
         matrix: &MatrixConfig,
         phases: Phases,
         seed: u64,
+        tick_interval_ns: u64,
     ) -> Result<Self> {
         let cpu = matches!(class, MatrixClass::W1 | MatrixClass::W2);
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&events);
+        let events = Arc::new(Events {
+            raw: Mutex::new(Vec::new()),
+            live: Mutex::new(LiveEvents::new(LIVE_CAPACITY)),
+        });
+        let output = EventPublisher {
+            events: Arc::clone(&events),
+            class,
+            retention_ns: OBSERVATION_WINDOW_NS
+                + if class == MatrixClass::W3 {
+                    matrix.workloads.w3.batch_deadline_ms * MS
+                } else {
+                    0
+                }
+                // Legacy observers use their scheduled cutoff. Keep the
+                // preceding window while their current tick is still fresh.
+                + if matrix.stage == MatrixStage::A7Pilot {
+                    0
+                } else {
+                    tick_interval_ns
+                },
+            latency_slo_ns: u128::from(match class {
+                MatrixClass::W2 => matrix.workloads.w2.p99_slo_ns,
+                _ => matrix.workloads.w1.p99_slo_ns,
+            }),
+        };
         let (start, gate) = mpsc::channel();
         let (ready, setup) = mpsc::channel();
         let matrix = matrix.clone();
@@ -366,7 +492,7 @@ impl Foreground {
                 // Resize and touch all pages before the gate. A growth past this reservation
                 // is still lossless.
                 if cpu {
-                    let mut output = output.lock().expect("events lock");
+                    let mut output = output.events.raw.lock().expect("raw events lock");
                     output.resize(
                         2_000_000,
                         Event {
@@ -478,16 +604,12 @@ fn join<T>(thread: JoinHandle<Result<T>>) -> Result<T> {
         .map_err(|_| MatrixError::new(VoidReason::Crash, "workload thread panicked"))?
 }
 
-fn publish(events: &Events, event: Event) {
-    events.lock().expect("events lock").push(event);
-}
-
 fn run_ping(
     client: &mut UnixStream,
     class: MatrixClass,
     phases: Phases,
     at: u64,
-    events: &Events,
+    events: &EventPublisher,
 ) -> Result<()> {
     sleep_until(at);
     loop {
@@ -509,20 +631,17 @@ fn run_ping(
                 "wrong UnixStream echo byte",
             ));
         }
-        publish(
-            events,
-            Event {
-                phase,
-                request_id: None,
-                release_ns: release,
-                deadline_ns: None,
-                submit_ns: Some(release),
-                checked_ns: Some(checked),
-                observed_ns: checked,
-                output: None,
-                drop_reason: None,
-            },
-        );
+        events.publish(Event {
+            phase,
+            request_id: None,
+            release_ns: release,
+            deadline_ns: None,
+            submit_ns: Some(release),
+            checked_ns: Some(checked),
+            observed_ns: checked,
+            output: None,
+            drop_reason: None,
+        });
     }
 }
 
@@ -555,7 +674,7 @@ fn run_inference(
     matrix: &MatrixConfig,
     phases: Phases,
     at: u64,
-    events: &Events,
+    events: &EventPublisher,
 ) -> Result<()> {
     let cfg = &matrix.workloads.w3;
     let mut previous_checked = None;
@@ -582,25 +701,22 @@ fn run_inference(
             previous_checked = Some(checked);
             (Some(observed), Some(checked), Some(output), checked)
         };
-        publish(
-            events,
-            Event {
-                phase,
-                request_id: Some(id as u64),
-                release_ns: release,
-                deadline_ns: Some(deadline),
-                submit_ns: submit,
-                checked_ns: checked,
-                observed_ns: observed,
-                output,
-                drop_reason: reason,
-            },
-        );
+        events.publish(Event {
+            phase,
+            request_id: Some(id as u64),
+            release_ns: release,
+            deadline_ns: Some(deadline),
+            submit_ns: submit,
+            checked_ns: checked,
+            observed_ns: observed,
+            output,
+            drop_reason: reason,
+        });
     }
     Ok(())
 }
 
-fn run_training(job: &Training, phases: Phases, at: u64, events: &Events) -> Result<()> {
+fn run_training(job: &Training, phases: Phases, at: u64, events: &EventPublisher) -> Result<()> {
     for phase in PROTECTED {
         sleep_until(at + phases.start(phase));
         loop {
@@ -610,20 +726,17 @@ fn run_training(job: &Training, phases: Phases, at: u64, events: &Events) -> Res
             }
             let output = job.step()?;
             let checked = now() - at;
-            publish(
-                events,
-                Event {
-                    phase,
-                    request_id: None,
-                    release_ns: release,
-                    deadline_ns: None,
-                    submit_ns: Some(release),
-                    checked_ns: Some(checked),
-                    observed_ns: checked,
-                    output: Some(output),
-                    drop_reason: None,
-                },
-            );
+            events.publish(Event {
+                phase,
+                request_id: None,
+                release_ns: release,
+                deadline_ns: None,
+                submit_ns: Some(release),
+                checked_ns: Some(checked),
+                observed_ns: checked,
+                output: Some(output),
+                drop_reason: None,
+            });
         }
     }
     Ok(())
@@ -632,6 +745,54 @@ fn run_training(job: &Training, phases: Phases, at: u64, events: &Events) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_observation_work_is_bounded_and_raw_evidence_is_lossless() {
+        let events = Arc::new(Events {
+            raw: Mutex::new(Vec::new()),
+            live: Mutex::new(LiveEvents::new(4)),
+        });
+        let writer = EventPublisher {
+            events: events.clone(),
+            class: MatrixClass::W1,
+            retention_ns: OBSERVATION_WINDOW_NS,
+            latency_slo_ns: 5,
+        };
+        let origin = SECOND;
+        for n in 0..10_000u64 {
+            let observed_ns = origin + n * MS;
+            let latency = if n.is_multiple_of(2) { 6 } else { 1 };
+            writer.publish(Event {
+                phase: 0,
+                request_id: None,
+                release_ns: observed_ns - latency,
+                deadline_ns: None,
+                submit_ns: None,
+                checked_ns: Some(observed_ns),
+                observed_ns,
+                output: None,
+                drop_reason: None,
+            });
+            if n == 100 || n == 9_999 {
+                let mut live = events.live.lock().unwrap();
+                assert_eq!(live.iter().len(), 4);
+                assert_eq!(live.violations, 2);
+                assert_eq!(live.capacity_evictions, n + 1 - 4);
+                assert!(live.w1_risk_window(observed_ns).is_none());
+            }
+        }
+        assert_eq!(events.raw.lock().unwrap().len(), 10_000);
+        let mut live = events.live.lock().unwrap();
+        let newest = origin + 9_999 * MS;
+        let recovered = live
+            .w1_risk_window(newest + OBSERVATION_WINDOW_NS - 3 * MS)
+            .unwrap();
+        assert_eq!(recovered.opportunities, 4);
+        assert_eq!(recovered.violations, 2);
+        let partial = live.w1_risk_window(newest + OBSERVATION_WINDOW_NS).unwrap();
+        assert_eq!(partial.opportunities, 1);
+        assert_eq!(partial.violations, 0);
+    }
 
     #[test]
     fn seeding_uses_wrapping_one_based_indices_and_replaces_zero() {

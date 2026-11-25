@@ -8,12 +8,13 @@
 
 mod analyze;
 mod config;
+pub mod cost_aware;
 mod matrix;
 mod metrics;
 mod runner;
 
 pub use analyze::{PairComparison, analyze, collect_p99};
-pub use config::StudyConfig;
+pub use config::{CostAwareConfig, ServiceCalibration, StudyConfig};
 pub use matrix::{
     MatrixClass, MatrixRun, MatrixTrial, record_matrix_reference, run_fixed_worker, run_matrix,
     run_matrix_in_scope,

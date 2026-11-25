@@ -1,18 +1,16 @@
 use super::{
     score::Completion,
-    workload::{Event, Events, inference_slots},
+    workload::{Event, Events, OBSERVATION_WINDOW_NS},
     *,
 };
 use crate::{
-    Source,
+    Seconds, Source,
     control::{
         ApplyOptions, AuditRecord, ControlAction, ControlError, ControlGuards, DelegatedScope,
         VerifiedApply,
     },
-    predict::{
-        EmaPredictor, MetaAction, Mlp100kPredictor, Observation as PredictorObservation,
-        ObservationWindow, Predictor, predict_with_budget,
-    },
+    predict::WorkerCompletion,
+    study::cost_aware::{CostAwareDecision, CostAwareState, ObservedDecisionInput},
 };
 use sha2::{Digest, Sha256};
 use std::{fs, io::BufRead, path::Path, time::Instant};
@@ -87,10 +85,11 @@ impl Oracle {
         })
     }
 
-    fn weight(&self, offset: u64, cfg: &StudyConfig) -> u32 {
+    fn weight(input: OracleDecisionInput<'_>) -> u32 {
+        let OracleDecisionInput { trace, offset, cfg } = input;
         let horizon = seconds_ns(cfg.oracle_horizon_secs);
         let protect = PROTECTED.into_iter().any(|phase| {
-            offset < self.phases.end(phase) && self.phases.start(phase) <= offset + horizon
+            offset < trace.phases.end(phase) && trace.phases.start(phase) <= offset + horizon
         });
         if protect {
             cfg.protected_weight
@@ -100,11 +99,17 @@ impl Oracle {
     }
 }
 
+struct OracleDecisionInput<'a> {
+    trace: &'a Oracle,
+    offset: u64,
+    cfg: &'a StudyConfig,
+}
+
 #[derive(Clone, Serialize)]
 struct Observation {
-    phase: &'static str,
-    foreground_active: bool,
-    phase_age_secs: f64,
+    phase: Option<&'static str>,
+    foreground_active: Option<bool>,
+    phase_age_secs: Option<f64>,
     samples: usize,
     p90_ns: Option<u128>,
     contention_proxy: Option<f64>,
@@ -119,10 +124,10 @@ fn observe(
     t: u64,
     events: &[Event],
 ) -> Observation {
-    const WINDOW: u64 = 200 * MS;
+    let window = OBSERVATION_WINDOW_NS;
     let phase = phases.phase(t).expect("control time inside trial");
     let start = phases.start(phase);
-    let from = start.max(t.saturating_sub(WINDOW));
+    let from = start.max(t.saturating_sub(window));
     let mut latencies = Vec::new();
     let mut timely = 0;
     let w3 = &matrix.workloads.w3;
@@ -151,18 +156,20 @@ fn observe(
     let phase_age_secs = (t - start) as f64 / SECOND as f64;
     let contention_proxy = observation_contention_proxy(class, matrix, &latencies);
     let deadline_misses = (class == MatrixClass::W3 && foreground_active).then(|| {
-        let due = inference_slots(phases, phase, w3.batch_period_ms * MS)
-            .map(|release| release + deadline)
-            .filter(|due| (from..=t).contains(due))
-            .count();
+        let period = w3.batch_period_ms * MS;
+        let first_due = start + deadline;
+        let due = t.checked_sub(first_due).map_or(0, |elapsed| {
+            let before_window = from.saturating_sub(first_due).div_ceil(period);
+            (elapsed / period + 1).saturating_sub(before_window) as usize
+        });
         due.saturating_sub(timely)
     });
-    let steps_per_sec = (class == MatrixClass::W4 && foreground_active && t - start >= WINDOW)
+    let steps_per_sec = (class == MatrixClass::W4 && foreground_active && t - start >= window)
         .then_some(latencies.len() as f64 / 0.2);
     Observation {
-        phase: NAMES[phase],
-        foreground_active,
-        phase_age_secs,
+        phase: Some(NAMES[phase]),
+        foreground_active: Some(foreground_active),
+        phase_age_secs: Some(phase_age_secs),
         samples: latencies.len(),
         p90_ns: (!latencies.is_empty()).then(|| crate::percentile(&latencies, 0.9)),
         contention_proxy,
@@ -187,7 +194,7 @@ fn observation_contention_proxy(
 }
 
 fn reactive_bad(class: MatrixClass, cfg: &StudyConfig, observation: &Observation) -> Option<bool> {
-    if !observation.foreground_active {
+    if observation.foreground_active == Some(false) {
         return Some(false);
     }
     match class {
@@ -259,13 +266,9 @@ pub(super) struct Tick {
     observation_cost_ns: u64,
     proposed_weight: Option<u32>,
     proposed_source: Option<Source>,
-    cost_aware_decision: Option<&'static str>,
-    benefit_lower_bound: Option<f64>,
-    cost_upper_bound: Option<f64>,
-    predictor_inference_cost_seconds: Option<f64>,
-    protected_seconds: Option<f64>,
-    predictor_name: Option<String>,
-    predictor_wall_ns: Option<u64>,
+    cost_aware: Option<CostAwareDecision>,
+    observation_capacity: usize,
+    observation_capacity_evictions: u64,
     weight_change_proposed: bool,
     effective_weight: u32,
     applied: Option<Effective>,
@@ -292,6 +295,8 @@ pub(super) struct ControlRun {
     pub apply_failed: bool,
     pub restored: bool,
     pub began_at_ns: Option<u64>,
+    late_worker_completion_after_last_tick: Option<WorkerCompletion>,
+    predictor_in_flight_at_trial_end: Option<u64>,
 }
 
 pub(super) struct Controller<'a> {
@@ -302,246 +307,6 @@ pub(super) struct Controller<'a> {
     pub arm: Arm,
     pub oracle: Option<&'a Oracle>,
     pub audit: &'a Path,
-}
-
-#[derive(Default)]
-struct CostAwareState {
-    window: ObservationWindow,
-    predictor_name: Option<String>,
-    predictor: Option<Box<dyn Predictor>>,
-}
-
-struct CostAwareDecision {
-    requested: u32,
-    source: Source,
-    decision: &'static str,
-    benefit_lower_bound: Option<f64>,
-    cost_upper_bound: Option<f64>,
-    predictor_name: String,
-    predictor_wall_ns: Option<u64>,
-    predictor_inference_cost_seconds: Option<f64>,
-    protected_seconds: Option<f64>,
-}
-
-impl CostAwareState {
-    #[allow(clippy::too_many_arguments)]
-    fn decide(
-        &mut self,
-        class: MatrixClass,
-        matrix: &MatrixConfig,
-        phases: Phases,
-        scheduled_ns: u64,
-        decision_now_seconds: f64,
-        deadline_seconds: f64,
-        events: &[Event],
-        observation: &Observation,
-        reactive: u32,
-        protected_weight: u32,
-    ) -> CostAwareDecision {
-        let signal = cost_aware_signal(class, matrix, observation);
-        if let Some(signal) = signal {
-            self.window.observations.push(PredictorObservation {
-                target: "slo-risk".into(),
-                observed_at_seconds: decision_now_seconds,
-                value: signal,
-                source: Source::Observed,
-            });
-            let keep = matrix.cost_aware.window_ticks;
-            if self.window.observations.len() > keep {
-                let excess = self.window.observations.len() - keep;
-                self.window.observations.drain(..excess);
-            }
-        }
-        let predictor_name = matrix.cost_aware.predictor.clone();
-        let protected_seconds =
-            protected_seconds_remaining(phases, scheduled_ns, matrix.cost_aware.horizon_secs);
-        let fallback = |benefit_lower_bound,
-                        cost_upper_bound,
-                        predictor_wall_ns,
-                        predictor_inference_cost_seconds| {
-            CostAwareDecision {
-                requested: reactive,
-                source: if signal.is_some() {
-                    Source::Observed
-                } else {
-                    Source::Assumed
-                },
-                decision: "skip",
-                benefit_lower_bound,
-                cost_upper_bound,
-                predictor_name: predictor_name.clone(),
-                predictor_wall_ns,
-                predictor_inference_cost_seconds,
-                protected_seconds: Some(protected_seconds),
-            }
-        };
-        let Some(base_rate) = observed_base_rate(class, matrix, phases, scheduled_ns, events)
-        else {
-            return fallback(None, None, None, None);
-        };
-        if self.predictor_name.as_deref() != Some(predictor_name.as_str()) {
-            self.predictor_name = Some(predictor_name.clone());
-            self.predictor = match predictor_name.as_str() {
-                "ema" => EmaPredictor::new(matrix.cost_aware.ema_alpha)
-                    .map(|predictor| Box::new(predictor) as Box<dyn Predictor>),
-                "mlp-100k" => Some(Box::new(Mlp100kPredictor::new())),
-                _ => None,
-            };
-        }
-        let Some(predictor) = self.predictor.as_deref() else {
-            return fallback(None, None, None, None);
-        };
-        let action = MetaAction {
-            model_id: predictor_name.clone(),
-            device: "cpu".into(),
-            budget: crate::Seconds::new(matrix.cost_aware.predictor_budget_ms / 1000.0)
-                .expect("validated predictor budget"),
-            horizon: crate::Seconds::new(matrix.cost_aware.horizon_secs)
-                .expect("validated predictor horizon"),
-            target: "slo-risk".into(),
-        };
-        let started = Instant::now();
-        let prediction = predict_with_budget(predictor, &self.window, &action);
-        let predictor_wall_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let Ok(prediction) = prediction else {
-            return fallback(
-                None,
-                Some(predictor_wall_ns as f64 / SECOND as f64 / matrix.cost_aware.horizon_secs),
-                Some(predictor_wall_ns),
-                Some(predictor_wall_ns as f64 / SECOND as f64),
-            );
-        };
-        let inference_seconds = prediction.inference_cost_seconds.get();
-        if decision_now_seconds + inference_seconds > deadline_seconds
-            || decision_now_seconds + inference_seconds > prediction.expires_at_seconds
-        {
-            return fallback(
-                None,
-                Some(
-                    (inference_seconds
-                        + matrix
-                            .cost_aware
-                            .marginal_background_delay_per_protected_second
-                            * protected_seconds)
-                        / matrix.cost_aware.horizon_secs,
-                ),
-                Some(predictor_wall_ns),
-                Some(inference_seconds),
-            );
-        }
-        let horizon = matrix.cost_aware.horizon_secs;
-        let no_prediction = base_rate.rate * base_rate.expected_events;
-        let uncertainty = prediction.uncertainty.get();
-        let benefit =
-            (no_prediction * prediction.predicted_value.clamp(0.0, 1.0) * (1.0 - uncertainty))
-                .max(0.0);
-        let cost = (inference_seconds
-            + matrix
-                .cost_aware
-                .marginal_background_delay_per_protected_second
-                * protected_seconds_remaining(phases, scheduled_ns, horizon))
-            / horizon;
-        if should_predict(benefit, cost) {
-            CostAwareDecision {
-                requested: protected_weight,
-                source: Source::Predicted,
-                decision: "predict",
-                benefit_lower_bound: Some(benefit),
-                cost_upper_bound: Some(cost),
-                predictor_name,
-                predictor_wall_ns: Some(predictor_wall_ns),
-                predictor_inference_cost_seconds: Some(inference_seconds),
-                protected_seconds: Some(protected_seconds),
-            }
-        } else {
-            fallback(
-                Some(benefit),
-                Some(cost),
-                Some(predictor_wall_ns),
-                Some(inference_seconds),
-            )
-        }
-    }
-}
-
-fn cost_aware_signal(
-    class: MatrixClass,
-    matrix: &MatrixConfig,
-    observation: &Observation,
-) -> Option<f64> {
-    if !observation.foreground_active {
-        return Some(0.0);
-    }
-    let contention = observation.contention_proxy?;
-    let deadline = f64::from(u8::from(
-        observation.deadline_misses.is_some_and(|misses| misses > 0),
-    ));
-    let age = (observation.phase_age_secs / matrix.cost_aware.horizon_secs).min(1.0);
-    Some(match class {
-        MatrixClass::W1 | MatrixClass::W2 | MatrixClass::W3 => contention.max(deadline) * age,
-        MatrixClass::W4 => 0.0,
-    })
-}
-
-struct BaseRate {
-    rate: f64,
-    expected_events: f64,
-}
-
-fn observed_base_rate(
-    class: MatrixClass,
-    matrix: &MatrixConfig,
-    phases: Phases,
-    t: u64,
-    events: &[Event],
-) -> Option<BaseRate> {
-    let (opportunities, violations) = events
-        .iter()
-        .filter(|event| event.observed_ns <= t && class.active(event.phase))
-        .fold((0, 0), |(opportunities, violations), event| {
-            let violation = match class {
-                MatrixClass::W1 | MatrixClass::W2 => event
-                    .latency()
-                    .is_some_and(|latency| latency > u128::from(matrix.workloads.w1.p99_slo_ns)),
-                MatrixClass::W3 => event.miss(),
-                MatrixClass::W4 => false,
-            };
-            (opportunities + 1, violations + usize::from(violation))
-        });
-    if opportunities == 0 || class == MatrixClass::W4 {
-        return None;
-    }
-    let active_ns = (0..4)
-        .filter(|&phase| class.active(phase))
-        .map(|phase| phases.end(phase).min(t).saturating_sub(phases.start(phase)))
-        .sum::<u64>();
-    if active_ns == 0 {
-        return None;
-    }
-    let rate = violations as f64 / opportunities as f64;
-    let event_rate = opportunities as f64 / (active_ns as f64 / SECOND as f64);
-    Some(BaseRate {
-        rate,
-        expected_events: event_rate * matrix.cost_aware.horizon_secs,
-    })
-}
-
-fn protected_seconds_remaining(phases: Phases, t: u64, horizon_secs: f64) -> f64 {
-    let horizon = seconds_ns(horizon_secs);
-    PROTECTED
-        .into_iter()
-        .map(|phase| {
-            let start = phases.start(phase).max(t);
-            let end = phases.end(phase).min(t.saturating_add(horizon));
-            end.saturating_sub(start) as f64 / SECOND as f64
-        })
-        .sum()
-}
-
-fn should_predict(benefit_lower_bound: f64, cost_upper_bound: f64) -> bool {
-    benefit_lower_bound.is_finite()
-        && cost_upper_bound.is_finite()
-        && benefit_lower_bound > cost_upper_bound
 }
 
 impl Controller<'_> {
@@ -555,29 +320,68 @@ impl Controller<'_> {
         let mut reactive = self.cfg.reactive_high_weight;
         let interval = self.cfg.control_tick_ms * MS;
         let matrix = matrix_config(self.cfg)?;
-        let mut cost_aware = CostAwareState::default();
+        let mut cost_aware = (self.arm == Arm::CostAware)
+            .then(|| CostAwareState::new(&matrix.cost_aware))
+            .transpose()?;
         for scheduled_ns in (0..self.phases.total()).step_by(interval as usize) {
             sleep_until(gate + scheduled_ns);
             let decision_start = now();
             result.began_at_ns.get_or_insert(decision_start);
             let process_decision_start = crate::monotonic_seconds();
-            let recent = {
-                let events = events.lock().expect("live events lock");
-                let earliest = 0;
-                let start = events.partition_point(|event| event.observed_ns < earliest);
-                let end = events.partition_point(|event| event.observed_ns <= scheduled_ns);
-                events[start..end].to_vec()
+            let mut risk = None;
+            let (observation, observed_at, observation_capacity, observation_capacity_evictions) = {
+                let mut live = events.live.lock().expect("live events lock");
+                let observation_cut_ns = now();
+                let observed_at = crate::monotonic_seconds();
+                let capacity = live.capacity;
+                let evictions = live.capacity_evictions;
+                if matrix.stage == MatrixStage::A7Pilot {
+                    // A7 W1 uses the actual observation cut, with no phase or phase age.
+                    let elapsed = observation_cut_ns - gate;
+                    risk = live.w1_risk_window(elapsed);
+                    let samples = live.iter().len();
+                    let mut latencies: Vec<_> =
+                        if live.covers_since(elapsed.saturating_sub(OBSERVATION_WINDOW_NS)) {
+                            live.iter().filter_map(|event| event.latency()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                    drop(live);
+                    let p90_ns = (!latencies.is_empty()).then(|| {
+                        let rank = ((latencies.len() - 1) as f64 * 0.9).ceil() as usize;
+                        *latencies.select_nth_unstable(rank).1
+                    });
+                    (
+                        Observation {
+                            phase: None,
+                            foreground_active: None,
+                            phase_age_secs: None,
+                            samples,
+                            p90_ns,
+                            contention_proxy: None,
+                            deadline_misses: None,
+                            steps_per_sec: None,
+                        },
+                        observed_at,
+                        capacity,
+                        evictions,
+                    )
+                } else {
+                    let recent: Vec<_> = live
+                        .iter()
+                        .filter(|event| event.observed_ns <= scheduled_ns)
+                        .collect();
+                    drop(live);
+                    let observation =
+                        observe(self.class, matrix, self.phases, scheduled_ns, &recent);
+                    (observation, observed_at, capacity, evictions)
+                }
             };
-            let observation = observe(self.class, matrix, self.phases, scheduled_ns, &recent);
             let observed = now();
             let mut forecast_ns = None;
             let mut cost_aware_decision = None;
-            let mut benefit_lower_bound = None;
-            let mut cost_upper_bound = None;
-            let mut predictor_name = None;
-            let mut predictor_wall_ns = None;
-            let mut predictor_inference_cost_seconds = None;
-            let mut protected_seconds = None;
+            let mut expires_at_seconds = None;
+            let tick_expires_ns = gate + scheduled_ns + interval;
             let proposal = match self.arm {
                 Arm::Native => None,
                 Arm::StaticLow => Some((self.cfg.static_weight, Source::Assumed)),
@@ -602,42 +406,49 @@ impl Controller<'_> {
                 }
                 Arm::Oracle => {
                     let entry = now();
-                    let weight = self
-                        .oracle
-                        .expect("loaded reference")
-                        .weight(scheduled_ns, self.cfg);
+                    let weight = Oracle::weight(OracleDecisionInput {
+                        trace: self.oracle.expect("loaded reference"),
+                        offset: scheduled_ns,
+                        cfg: self.cfg,
+                    });
                     forecast_ns = Some(now() - entry);
                     Some((weight, Source::StudyOracle))
                 }
                 Arm::CostAware => {
-                    if let Some(bad) = reactive_bad(self.class, self.cfg, &observation) {
+                    let signal = reactive_bad(self.class, self.cfg, &observation);
+                    if let Some(bad) = signal {
                         reactive = if bad {
                             self.cfg.reactive_low_weight
                         } else {
                             self.cfg.reactive_high_weight
                         };
                     }
-                    let decision = cost_aware.decide(
-                        self.class,
-                        matrix,
-                        self.phases,
-                        scheduled_ns,
-                        process_decision_start,
-                        (gate + scheduled_ns + interval) as f64 / SECOND as f64,
-                        &recent,
-                        &observation,
-                        reactive,
-                        self.cfg.protected_weight,
+                    let prediction_deadline = Instant::now()
+                        + Duration::from_nanos(tick_expires_ns.saturating_sub(now()));
+                    let decision = cost_aware.as_mut().expect("online controller").decide(
+                        ObservedDecisionInput {
+                            risk,
+                            observed_at_seconds: observed_at,
+                            observation_cost: Seconds::new(
+                                (observed - decision_start) as f64 / SECOND as f64,
+                            )
+                            .unwrap(),
+                            prediction_deadline,
+                            fallback_weight: reactive,
+                            fallback_source: if signal.is_some() {
+                                Source::Observed
+                            } else {
+                                Source::Assumed
+                            },
+                            protected_weight: self.cfg.protected_weight,
+                        },
                     );
-                    cost_aware_decision = Some(decision.decision);
-                    benefit_lower_bound = decision.benefit_lower_bound;
-                    cost_upper_bound = decision.cost_upper_bound;
-                    predictor_name = Some(decision.predictor_name);
-                    predictor_wall_ns = decision.predictor_wall_ns;
-                    predictor_inference_cost_seconds = decision.predictor_inference_cost_seconds;
-                    protected_seconds = decision.protected_seconds;
-                    forecast_ns = predictor_wall_ns;
-                    Some((decision.requested, decision.source))
+                    forecast_ns =
+                        (decision.predictor_invocations > 0).then_some(decision.predictor_wall_ns);
+                    expires_at_seconds = decision.expires_at_seconds;
+                    let proposal = Some((decision.requested, decision.source));
+                    cost_aware_decision = Some(decision);
+                    proposal
                 }
             };
             let decision_end = now();
@@ -652,8 +463,8 @@ impl Controller<'_> {
                     workload: self.class.name().into(),
                     cgroup: paths.clone(),
                     cpu_weight: requested,
-                    // The study actuator uses the absolute gate-based deadline.
-                    expires_at_seconds: f64::INFINITY,
+                    // The independent tick deadline still applies to every proposal.
+                    expires_at_seconds: expires_at_seconds.unwrap_or(f64::INFINITY),
                     source,
                 };
                 let attempt = actuator.apply_verified(
@@ -664,7 +475,7 @@ impl Controller<'_> {
                         now_seconds: process_decision_start,
                     },
                     process_decision_start,
-                    gate + scheduled_ns + interval,
+                    tick_expires_ns,
                 );
                 (applied, outcome, error) =
                     result.record_proposal(attempt, gate, effective_weight, requested);
@@ -682,13 +493,9 @@ impl Controller<'_> {
                 observation_cost_ns: observed - decision_start,
                 proposed_weight: proposal.map(|p| p.0),
                 proposed_source: proposal.map(|p| p.1),
-                cost_aware_decision,
-                benefit_lower_bound,
-                cost_upper_bound,
-                predictor_inference_cost_seconds,
-                protected_seconds,
-                predictor_name,
-                predictor_wall_ns,
+                cost_aware: cost_aware_decision,
+                observation_capacity,
+                observation_capacity_evictions,
                 weight_change_proposed,
                 effective_weight,
                 applied,
@@ -700,6 +507,10 @@ impl Controller<'_> {
         }
         sleep_until(gate + self.phases.total());
         result.restored = actuator.restore_all().is_ok();
+        if let Some(online) = &mut cost_aware {
+            result.late_worker_completion_after_last_tick = online.reap_late();
+            result.predictor_in_flight_at_trial_end = online.in_flight_generation();
+        }
         Ok(result)
     }
 
@@ -1097,34 +908,49 @@ impl ControlRun {
             .map(|t| t.decision_end_ns - t.decision_start_ns)
             .sum();
         let observation: u64 = self.ticks.iter().map(|t| t.observation_cost_ns).sum();
-        let cost_aware_ticks: Vec<_> = self
+        let online = self
             .ticks
             .iter()
-            .filter(|tick| tick.cost_aware_decision.is_some())
-            .collect();
-        let cost_aware_predictions = cost_aware_ticks
-            .iter()
-            .filter(|tick| tick.cost_aware_decision == Some("predict"))
-            .count();
-        let cost_aware_skips = cost_aware_ticks
-            .iter()
-            .filter(|tick| tick.cost_aware_decision == Some("skip"))
-            .count();
-        let cost_aware_total: u64 = cost_aware_ticks
-            .iter()
-            .filter_map(|tick| tick.predictor_wall_ns)
+            .filter_map(|tick| tick.cost_aware.as_ref());
+        let online_ticks = online.clone().count();
+        let decisions = |label| online.clone().filter(|tick| tick.decision == label).count();
+        let invocations: u64 = online
+            .clone()
+            .map(|tick| u64::from(tick.predictor_invocations))
             .sum();
+        let completions = online
+            .clone()
+            .flat_map(|tick| {
+                [
+                    tick.worker_completion.as_ref(),
+                    tick.late_worker_completion.as_ref(),
+                ]
+            })
+            .flatten()
+            .chain(self.late_worker_completion_after_last_tick.as_ref());
+        let completion_count = completions.clone().count();
+        let worker_cost: u64 = completions.clone().map(|row| row.worker_wall_ns).sum();
+        let late = completions.filter(|row| row.dropped_late_result);
+        let late_count = late.clone().count();
+        let late_cost: u64 = late.map(|row| row.worker_wall_ns).sum();
         serde_json::json!({
             "active_tick_compute_ns": (!self.ticks.is_empty()).then_some(active),
             "observation_cost_ns": (!self.ticks.is_empty()).then_some(observation),
-            "prediction_count": (count > 0).then_some(count),
-            "prediction_cost_ns": (count > 0).then_some(forecast),
-            "prediction_device_wake_ns": null
-            ,"cost_aware_predicted_count": (!cost_aware_ticks.is_empty()).then_some(cost_aware_predictions)
-            ,"cost_aware_skipped_count": (!cost_aware_ticks.is_empty()).then_some(cost_aware_skips)
-            ,"cost_aware_total_prediction_cost_ns": (!cost_aware_ticks.is_empty()).then_some(cost_aware_total)
-            ,"cost_aware_mean_predictor_cost_ns": (cost_aware_predictions + cost_aware_skips > 0)
-                .then_some(cost_aware_total as f64 / (cost_aware_predictions + cost_aware_skips) as f64)
+            "observation_capacity": self.ticks.last().map(|tick| tick.observation_capacity),
+            "observation_capacity_evictions_at_last_tick": self.ticks.last().map(|tick| tick.observation_capacity_evictions),
+            "prediction_count": (count > 0 || online_ticks > 0).then_some(count),
+            "prediction_cost_ns": (count > 0 || online_ticks > 0).then_some(forecast),
+            "prediction_device_wake_ns": null,
+            "cost_aware_accepted_count": (online_ticks > 0).then(|| decisions("accept-prediction")),
+            "cost_aware_rejected_count": (online_ticks > 0).then(|| decisions("reject-prediction")),
+            "cost_aware_skipped_before_predict_count": (online_ticks > 0).then(|| decisions("skip-before-predict")),
+            "predictor_invocations": (online_ticks > 0).then_some(invocations),
+            "predictor_worker_completion_count": (online_ticks > 0).then_some(completion_count),
+            "predictor_completed_worker_wall_ns": (completion_count > 0).then_some(worker_cost),
+            "predictor_dropped_late_result_count": (online_ticks > 0).then_some(late_count),
+            "predictor_dropped_late_worker_wall_ns": (late_count > 0).then_some(late_cost),
+            "predictor_final_late_completion": self.late_worker_completion_after_last_tick,
+            "predictor_in_flight_generation_at_trial_end": self.predictor_in_flight_at_trial_end,
         })
     }
 
@@ -1164,8 +990,6 @@ impl ControlRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Seconds;
-    use crate::predict::{MetaAction, Observation as PredictorObservation, ObservationWindow};
 
     #[test]
     fn refused_expiry_counts_without_satisfying_any_effective_sequence_requirements() {
@@ -1189,126 +1013,6 @@ mod tests {
                 .contains(&VoidReason::MissingOracleTransition)
         );
         fs::remove_file(audit).unwrap();
-    }
-
-    #[test]
-    fn cost_boundary_skips_when_cost_is_equal_or_higher() {
-        assert!(should_predict(1.01, 1.0));
-        assert!(!should_predict(1.0, 1.0));
-        assert!(!should_predict(0.99, 1.0));
-    }
-
-    #[test]
-    fn missing_observation_data_falls_back_to_reactive() {
-        let cfg = StudyConfig::from_file(Path::new("configs/matrix-h3-pilot.json")).unwrap();
-        let matrix = matrix_config(&cfg).unwrap();
-        let phases = Phases::new(cfg.phase_durations_secs);
-        let observation = Observation {
-            phase: "burst",
-            foreground_active: true,
-            phase_age_secs: 0.1,
-            samples: 0,
-            p90_ns: None,
-            contention_proxy: None,
-            deadline_misses: None,
-            steps_per_sec: None,
-        };
-        let decision = CostAwareState::default().decide(
-            MatrixClass::W1,
-            matrix,
-            phases,
-            phases.start(1),
-            1.0,
-            2.0,
-            &[],
-            &observation,
-            cfg.reactive_high_weight,
-            cfg.protected_weight,
-        );
-        assert_eq!(decision.decision, "skip");
-        assert_eq!(decision.requested, cfg.reactive_high_weight);
-        assert_eq!(decision.source, Source::Assumed);
-        assert!(decision.benefit_lower_bound.is_none());
-    }
-
-    #[test]
-    fn fixed_observation_window_is_deterministic() {
-        let action = MetaAction {
-            model_id: "ema".into(),
-            device: "cpu".into(),
-            budget: Seconds::new(1.0).unwrap(),
-            horizon: Seconds::new(0.5).unwrap(),
-            target: "slo-risk".into(),
-        };
-        let window = ObservationWindow {
-            observations: vec![
-                PredictorObservation {
-                    target: "slo-risk".into(),
-                    observed_at_seconds: 1.0,
-                    value: 0.25,
-                    source: Source::Observed,
-                },
-                PredictorObservation {
-                    target: "slo-risk".into(),
-                    observed_at_seconds: 1.05,
-                    value: 0.75,
-                    source: Source::Observed,
-                },
-            ],
-        };
-        let predictor = EmaPredictor::new(0.5).unwrap();
-        let first = predictor.predict(&window, &action).unwrap();
-        let second = predictor.predict(&window, &action).unwrap();
-        assert_eq!(first.predicted_value, second.predicted_value);
-        assert_eq!(first.expires_at_seconds, second.expires_at_seconds);
-    }
-
-    #[test]
-    fn cost_aware_predictors_reject_oracle_provenance() {
-        let action = MetaAction {
-            model_id: "ema".into(),
-            device: "cpu".into(),
-            budget: Seconds::new(1.0).unwrap(),
-            horizon: Seconds::new(0.5).unwrap(),
-            target: "slo-risk".into(),
-        };
-        let window = ObservationWindow {
-            observations: vec![PredictorObservation {
-                target: "slo-risk".into(),
-                observed_at_seconds: 1.0,
-                value: 1.0,
-                source: Source::StudyOracle,
-            }],
-        };
-        let predictor = EmaPredictor::new(0.5).unwrap();
-        assert_eq!(
-            predict_with_budget(&predictor, &window, &action),
-            Err(crate::predict::PredictError::InvalidTrace(
-                "oracle observations are restricted to oracle predictors".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn configured_mlp_predictor_is_used_without_oracle_source() {
-        let action = MetaAction {
-            model_id: "mlp-100k".into(),
-            device: "cpu".into(),
-            budget: Seconds::new(1.0).unwrap(),
-            horizon: Seconds::new(0.5).unwrap(),
-            target: "slo-risk".into(),
-        };
-        let window = ObservationWindow {
-            observations: vec![PredictorObservation {
-                target: "slo-risk".into(),
-                observed_at_seconds: 1.0,
-                value: 0.5,
-                source: Source::Observed,
-            }],
-        };
-        let prediction = predict_with_budget(&Mlp100kPredictor::new(), &window, &action).unwrap();
-        assert_eq!(prediction.model_id, "mlp-100k");
-        assert_eq!(prediction.source, Source::Predicted);
     }
 
     #[test]
@@ -1381,13 +1085,9 @@ mod tests {
                 observation_cost_ns: 0,
                 proposed_weight: Some(requested),
                 proposed_source: Some(Source::StudyOracle),
-                cost_aware_decision: None,
-                benefit_lower_bound: None,
-                cost_upper_bound: None,
-                predictor_inference_cost_seconds: None,
-                protected_seconds: None,
-                predictor_name: None,
-                predictor_wall_ns: None,
+                cost_aware: None,
+                observation_capacity: 0,
+                observation_capacity_evictions: 0,
                 weight_change_proposed,
                 effective_weight,
                 applied: None,

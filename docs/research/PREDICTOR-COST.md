@@ -1,6 +1,6 @@
 # 预测计算成本
 
-2026 年 11 月 25 日（UTC+08:00），在同一台 aarch64 主机上测量 batch=1、同步返回的 `f32` MLP。这个测量为 value-of-computation 方程中的 `C_infer` 提供实测延迟，并为常驻 GPU 队列停用后的额外延迟提供观测。方程还需要观测、执行和预期收益的独立数据。[RESEARCH.md](RESEARCH.md)
+2026 年 11 月 25 日（UTC+08:00），在同一台 aarch64 主机上测量 batch=1、同步返回的 `f32` MLP。`SyntheticMlpCostModel` 使用固定种子的随机权重和合成输入，提供 `C_infer` 的计算延迟和 GPU 队列停用后的额外延迟。表中的最大绝对误差衡量与标量 CPU 输出的数值一致性，预测精度为 `Unavailable`。方程还需要观测、执行和预期收益的独立数据。 [RESEARCH.md](RESEARCH.md)
 
 ## 复现命令
 

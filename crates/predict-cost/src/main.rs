@@ -4,7 +4,7 @@ mod model;
 mod power;
 
 use clap::{Parser, ValueEnum};
-use model::{EPSILON, Features, Model, Prediction, features};
+use model::{EPSILON, Features, SyntheticMlpCostModel, SyntheticOutput, features};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -59,7 +59,7 @@ impl Size {
 }
 
 #[derive(Parser)]
-#[command(about = "Measure synchronous batch-one MLP inference on scalar CPU and Vulkan GPU")]
+#[command(about = "Benchmark a fixed-seed synthetic MLP on scalar CPU and Vulkan GPU")]
 struct Args {
     /// Create a new JSONL artifact. An existing file will not be overwritten.
     #[arg(long)]
@@ -146,6 +146,9 @@ fn run(args: &Args) -> Result<bool> {
         "schema_version": 1,
         "source": "Observed",
         "inputs": "synthetic",
+        "model_kind": "synthetic-random-weight-mlp-cost-only",
+        "forecast_accuracy": null,
+        "max_abs_error_definition": "numerical agreement with scalar CPU output",
         "argv": std::env::args().collect::<Vec<_>>(),
         "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
         "seed": args.seed,
@@ -188,7 +191,7 @@ fn run(args: &Args) -> Result<bool> {
         trace.run = repeat as u32 + 1;
         for size_index in 0..sizes.len() {
             let size = sizes[(size_index + repeat) % sizes.len()];
-            let model = Arc::new(Model::new(size.width(), args.seed));
+            let model = Arc::new(SyntheticMlpCostModel::new(size.width(), args.seed));
             let mut scalar = cpu::Scalar::new(&model);
             let expected = inputs.map(|input| scalar.infer(&input));
             for variant in 0..backends.len() {
@@ -292,8 +295,8 @@ fn measure(
     trace: &mut Trace,
     args: &Args,
     inputs: &[Features; 8],
-    expected: &[Prediction; 8],
-    mut infer: impl FnMut(&Features) -> std::result::Result<Prediction, String>,
+    expected: &[SyntheticOutput; 8],
+    mut infer: impl FnMut(&Features) -> std::result::Result<SyntheticOutput, String>,
 ) -> Result<bool> {
     let mut call = |i: usize| -> Result<Inference> {
         let index = i % inputs.len();

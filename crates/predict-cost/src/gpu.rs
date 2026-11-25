@@ -1,4 +1,4 @@
-use crate::model::{Features, INPUTS, Model, OUTPUTS, Prediction};
+use crate::model::{Features, INPUTS, OUTPUTS, SyntheticMlpCostModel, SyntheticOutput};
 use std::{
     sync::{Arc, Mutex, mpsc},
     time::Duration,
@@ -32,7 +32,7 @@ struct Dispatch {
 }
 
 impl Gpu {
-    pub fn new(model: &Model) -> Result<Self, String> {
+    pub fn new(model: &SyntheticMlpCostModel) -> Result<Self, String> {
         let adapter = gpu_probe::vulkan_adapters()
             .into_iter()
             .find(|adapter| {
@@ -205,7 +205,7 @@ impl Gpu {
         Ok(gpu)
     }
 
-    pub fn infer(&self, features: &Features) -> Result<Prediction, String> {
+    pub fn infer(&self, features: &Features) -> Result<SyntheticOutput, String> {
         self.upload
             .slice(..)
             .get_mapped_range_mut()
@@ -246,7 +246,7 @@ impl Gpu {
             result.map_err(|e| format!("GPU {buffer} mapping: {e}"))?;
         }
         let data = self.readback.slice(..).get_mapped_range();
-        let output: Prediction = bytemuck::cast_slice(&data).try_into().unwrap();
+        let output: SyntheticOutput = bytemuck::cast_slice(&data).try_into().unwrap();
         drop(data);
         self.readback.unmap();
         Ok(output)
@@ -278,7 +278,7 @@ mod tests {
             (966, 1_000_780),
             (1965, 3_998_779),
         ] {
-            let model = Model::new(width, 42);
+            let model = SyntheticMlpCostModel::new(width, 42);
             assert_eq!(model.parameters(), expected);
             assert_eq!(model.layers[1].parameters.len(), width * (width + 1));
             assert_eq!(bytes(model.parameters()), expected as u64 * 4);
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_reference_for_consecutive_inputs() {
-        let model = Model::new(71, 42);
+        let model = SyntheticMlpCostModel::new(71, 42);
         let gpu = match Gpu::new(&model) {
             Ok(gpu) => gpu,
             Err(error) if error == "no physical NVIDIA Vulkan adapter" => {

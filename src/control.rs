@@ -1,6 +1,6 @@
 use crate::{
     ActionError, Seconds, Source,
-    predict::{MetaAction, Observation, ObservationWindow, OraclePredictor, predict_with_budget},
+    predict::{MetaAction, Observation, ObservationWindow, OraclePredictor, Predictor},
     validate_cpu_weight,
 };
 use serde::{Deserialize, Serialize};
@@ -111,7 +111,7 @@ impl Controller for OracleController {
             horizon: Seconds::new(1.0)?,
             target: self.target.clone(),
         };
-        let prediction = predict_with_budget(&self.predictor, &window, &request).ok()?;
+        let prediction = self.predictor.predict(&window, &request).ok()?;
         Some(ControlAction {
             workload: o.workload.clone(),
             cgroup: path.into(),

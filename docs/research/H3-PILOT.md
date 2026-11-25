@@ -6,6 +6,11 @@ CostAware、Reactive、Oracle 和 Native 四个 arm。Pilot 使用 seeds `1001..
 报告 foreground latency 和 CPU deadline 两个维度，不把单一 joint gate 当作唯一
 结论。
 
+**历史限制（2026-11-25，A7）：旧 H3 的 884/1,440 次正向决策是 predictor
+调用后的结果采纳次数。该计数无法证明节省了预测获取成本、产生了正的净收益，
+或支持 CostAware 的因果判断。旧实现使用未来保护相位为成本定价，并把预期违规
+事件数与时间比例直接比较。下表保留当时实测的描述性结果。**
+
 ## Pilot 设计
 
 配置文件为 `configs/matrix-h3-pilot.json`。W1 的 protected phases 是 `burst` 和
@@ -18,7 +23,7 @@ CostAware、Reactive、Oracle 和 Native 四个 arm。Pilot 使用 seeds `1001..
 Pilot 的原始 JSONL 位于
 `/tmp/harm-h3-pilot-20261125-run1/feasibility-h3-w1/`。每个 trial 都保留了
 `matrix_trial_summary`、`matrix_trial_verdict`、controller tick 和 actuator audit
-记录。复现单个 feasibility trial 的命令如下。
+记录。下面是历史采集命令。它需要原版代码 `b76b950`。A7 runner 拒绝执行旧配置。
 
 ```bash
 cargo run --release --locked -- study run --smoke \
@@ -55,9 +60,9 @@ CostAware 没有产生一个 latency pass。Native 的 CPU deadline pass 是 `6/
 和一台 host 只支持 feasibility 描述，不能支持 H3 的 paired CI、non-inferiority
 或 efficacy 结论。
 
-## CostAware signal and estimator
+## Historical CostAware signal and estimator
 
-每个 tick 只使用 arm 自己截至该 tick 的 observed data。signal 包含 foreground
+历史 predictor 的输入包含截至该 tick 的旧观测和按固定时序推导的 phase age。signal 包含 foreground
 p90、contention proxy 和 phase-age estimate。实现中的 contention proxy 是
 `min(foreground_p90 / SLO, 1)`。W1 中的 signal 可写为
 
@@ -66,10 +71,9 @@ s_t = max(contention_proxy, deadline_miss_indicator)
       × min(phase_age / horizon, 1)
 ```
 
-`EMA` 在最近四个 observed signal 上运行。配置也接受 `mlp-100k`，该 predictor
-是确定性的 CPU MLP，报告中的 pilot 使用 `EMA`。CostAware 不读取 Oracle trace，
-predictor 只接受 `Source::Observed` observation，Oracle provenance 会被
-`predict_with_budget` 拒绝。
+历史试点使用 `EMA` 平滑最近四个 signal。EMA 没有精度或不确定度校准。
+虽然政策没有读取独立的 Oracle trace，下面的 `protected_seconds` 依然来自
+预设的未来相位边界，因此整个决策路径未满足在线信息隔离。
 
 令 `r_t` 为 trial 到当前 tick 的 observed violation count 除以 observed
 opportunities，令 `lambda_H` 为 observed opportunity rate 乘以 horizon。无保护
@@ -79,15 +83,14 @@ opportunities，令 `lambda_H` 为 observed opportunity rate 乘以 horizon。�
 N_no_protect = r_t × lambda_H
 ```
 
-若 predictor 输出风险 `p_hat` 和 uncertainty `u`，benefit 的 conservative lower
-bound 为
+若 predictor 输出风险 `p_hat` 和未校准的 uncertainty `u`，旧日志中的
+`benefit_lower_bound` 定义为
 
 ```text
 B_L = N_no_protect × clamp(p_hat, 0, 1) × (1 - u)
 ```
 
-其中 `r_t` 和 `lambda_H` 都由 trial 内截至当前 tick 的 observed event 得出。成本
-upper bound 为
+其中 `r_t` 和 `lambda_H` 都由 trial 内截至当前 tick 的 observed event 得出。旧日志中的 `cost_upper_bound` 定义为
 
 ```text
 C_U = (predictor_wall_time
@@ -106,7 +109,8 @@ unavailable，且不替代 trial-level SLO score。
 
 ## Decision rates
 
-`predict` 表示 `B_L > C_U` 的正向决策，`skip` 表示 fallback 到 Reactive。
+旧标签 `predict` 表示预测结果通过 `B_L > C_U` 检查，`skip` 表示回退至
+Reactive。两种标签均可在调用预测器之后产生。
 `mean predictor cost per tick` 使用所有 240 个 CostAware ticks 作分母。括号中的
 `mean per predictor call` 只使用实际调用 predictor 的 ticks。
 
@@ -121,9 +125,8 @@ unavailable，且不替代 trial-level SLO score。
 | **Pooled** | **884** | **556** | **61.4%** | **3,078,377 ns** | **2,138 ns** |
 
 Pooled predictor calls 是 `1,428`，因此实际调用的 mean wall time 是 `2,156 ns`
-per call。所有 `884` 个 `predict` decision 都满足记录时的严格 benefit-cost
-边界，且 `B_L` 为正。这个 pilot 因而确实产生了 defensible positive decision，
-但 following-window outcome 没有转化为 latency pass。CostAware 的六个 trial
+per call。所有 `884` 个 `predict` decision 都满足当时日志中记录的数值比较。两项的量纲不同，
+这项检查只复核历史日志。试点中的 latency pass 为 `0/6`。CostAware 的六个 trial
 中，following window outcome 为 `violation` 的 tick 有 `1,420` 个，另有
 `deadline_miss` 的 tick `20` 个，未出现 `pass`。
 
@@ -153,11 +156,9 @@ latency pass 和 joint pass 都是 `0/6`，但 CostAware 的 CPU deadline pass �
 `4/6`，Reactive 是 `5/6`。CostAware 也没有低于 Oracle 的 prediction cost，
 并且没有同时击败 Reactive 和 Oracle。
 
-Estimator 在 `884/1440` 个决策 tick 上产生了满足 `B_L > C_U` 的正向
-`predict` decision，所以它不是一个永远 skip 的实现。可是这些正向决策没有在
-trial-level latency outcome 中产生可见收益，Oracle 的 `6/6` latency pass 也没有
-被 CostAware 复制。这个结果只能说明当前 observed-only EMA estimator 在这一组
-W1 feasibility 条件下可运行并会作出正向决策，不能说明它能改善服务。
+这批数据记录了旧实现的服务表现。由于未来信息泄漏、量纲不一致以及缺乏
+预测获取对照，无法推断 gating 的净效益，也无法区分 predictor、控制策略
+和时序对服务差距的贡献。
 
 本 pilot 明确不能支持以下结论。
 
@@ -165,9 +166,9 @@ W1 feasibility 条件下可运行并会作出正向决策，不能说明它能�
 - CostAware 在另一台 host、另一种 residency state 或另一种 calibration 上有效。
 - CostAware 相对 Reactive 的 paired efficacy、non-inferiority 或 universal
   dominance。
-- CostAware 的 observed-only benefit estimator 对未来 violation 有经过验证的
-  calibration。
+- EMA forecast 的校准精度、可执行的提前量、预测获取节省或正的因果净收益。
 - 预测成本和 service benefit 在更大样本上的稳定排序。
 
-H3 后续研究仍需先满足 A5 feasibility precondition，再按 paired foreground
-latency、CPU deadline 和 measured end-to-end cost 进行预注册比较。
+后续研究遵循 A7 信息隔离和版本化校准，并保留 A5 feasibility precondition。
+随后用配对的 always-predict 对照联合报告 foreground latency、CPU deadline
+和实际获取开销。参见 [Validity audit](VALIDITY-AUDIT.md)。
